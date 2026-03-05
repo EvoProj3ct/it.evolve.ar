@@ -18,6 +18,7 @@ const COLORS: Record<ColorKey, number> = {
 
 type Plane = { point: THREE.Vector3; normal: THREE.Vector3 };
 
+// ---------------- type guards ----------------
 function isMaterialWithColor(
     m: unknown
 ): m is THREE.Material & { color: THREE.Color; needsUpdate: boolean } {
@@ -29,6 +30,7 @@ function isMaterialWithColor(
   );
 }
 
+// ---------------- component ----------------
 export default function ARScene() {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
@@ -47,10 +49,6 @@ export default function ARScene() {
   const sessionRef = useRef<XRSession | null>(null);
   const refSpaceRef = useRef<XRReferenceSpace | null>(null);
 
-  // viewer hit-test per snap su muro
-  const viewerHitTestSourceRef = useRef<XRHitTestSource | null>(null);
-  const lastFrameRef = useRef<XRFrame | null>(null);
-
   // Anchors
   const anchorsSupportedRef = useRef(false);
   const anchoredRef = useRef<Anchored[]>([]);
@@ -61,7 +59,7 @@ export default function ARScene() {
   const [colorKey, setColorKey] = useState<ColorKey>("magenta");
   const thicknessRef = useRef(0.06);
 
-  // piano davanti (fallback) su cui disegni
+  // fallback plane davanti (se non c'è hit-test touch)
   const drawPlaneRef = useRef<Plane | null>(null);
   const drawDistanceRef = useRef(1.6);
 
@@ -74,6 +72,18 @@ export default function ARScene() {
 
   const raycasterRef = useRef(new THREE.Raycaster());
   const previewThrottleRef = useRef(0);
+
+  // ✅ transient hit-test per touchscreen (precisione massima)
+  const transientHitTestSourceRef = useRef<XRHitTestSource | null>(null);
+
+  // ✅ salvo l'ultimo hit valido mentre disegno (pos + rot della superficie)
+  const lastSurfaceHitRef = useRef<{
+    position: THREE.Vector3;
+    orientation: THREE.Quaternion;
+  } | null>(null);
+
+  // per update in loop
+  const lastFrameRef = useRef<XRFrame | null>(null);
 
   useEffect(() => {
     const container = containerRef.current!;
@@ -161,7 +171,8 @@ export default function ARScene() {
 
     sessionRef.current = session;
     anchorsSupportedRef.current =
-        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor === "function";
+        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor ===
+        "function";
 
     const renderer = rendererRef.current!;
     renderer.setClearColor(0x000000, 0);
@@ -172,18 +183,24 @@ export default function ARScene() {
     const refSpace = await session.requestReferenceSpace("local");
     refSpaceRef.current = refSpace;
 
-    // ✅ viewer hit-test (snap)
+    // ✅ transient hit-test per touchscreen (il dito!)
+    // profile standard: "generic-touchscreen"
     try {
-      const viewerSpace = await session.requestReferenceSpace("viewer");
-      viewerHitTestSourceRef.current =
-          (await session.requestHitTestSource?.({ space: viewerSpace })) ?? null;
+      transientHitTestSourceRef.current =
+          (await (session as unknown as {
+            requestHitTestSourceForTransientInput?: (o: {
+              profile: string;
+            }) => Promise<XRHitTestSource>;
+          }).requestHitTestSourceForTransientInput?.({ profile: "generic-touchscreen" })) ??
+          null;
     } catch {
-      viewerHitTestSourceRef.current = null;
+      transientHitTestSourceRef.current = null;
     }
 
     session.addEventListener("end", () => {
-      viewerHitTestSourceRef.current = null;
+      transientHitTestSourceRef.current = null;
       lastFrameRef.current = null;
+      lastSurfaceHitRef.current = null;
 
       refSpaceRef.current = null;
       sessionRef.current = null;
@@ -209,28 +226,27 @@ export default function ARScene() {
 
     renderer.setAnimationLoop((_time, frame) => {
       const three = threeRef.current!;
-      const refSpaceNow = refSpaceRef.current!;
-
       lastFrameRef.current = frame ?? null;
 
+      // 1) mentre disegni: prendo punti REALI da hit-test touchscreen (se possibile)
       if (frame && drawRef.current.drawing) {
-        const pt = pointFromScreenOnDrawPlane();
+        const pt = pointFromTouchHitTest(frame) ?? pointFromScreenOnDrawPlane();
         if (pt) {
           drawRef.current.pointsWorld.push(pt);
           three.trail.pushPoint(pt);
 
           const now = performance.now();
-          if (now - previewThrottleRef.current > 45) {
+          if (now - previewThrottleRef.current > 40) {
             previewThrottleRef.current = now;
             updatePreview(drawRef.current.pointsWorld);
           }
         }
       }
 
-      // aggiorna ancore
-      if (frame) {
+      // 2) aggiorno ancore
+      if (frame && refSpaceRef.current) {
         for (const item of anchoredRef.current) {
-          const pose = frame.getPose(item.anchor.anchorSpace, refSpaceNow);
+          const pose = frame.getPose(item.anchor.anchorSpace, refSpaceRef.current);
           if (!pose) continue;
           const t = pose.transform;
           item.obj.position.set(t.position.x, t.position.y, t.position.z);
@@ -259,16 +275,22 @@ export default function ARScene() {
     const three = threeRef.current!;
     drawRef.current = { drawing: true, pointsWorld: [] };
     previewThrottleRef.current = 0;
+    lastSurfaceHitRef.current = null;
 
-    // fallback plane davanti camera
+    // fallback plane davanti camera (solo se transient non c'è / non becca)
     const renderer = rendererRef.current!;
-    const cam = renderer.xr.getCamera() as unknown as THREE.Camera;
+    const cam = getXRRenderCamera(renderer, three.camera);
 
     const camPos = new THREE.Vector3();
     cam.getWorldPosition(camPos);
 
-    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).normalize();
-    const pointOnPlane = camPos.clone().add(forward.clone().multiplyScalar(drawDistanceRef.current));
+    const camQ = new THREE.Quaternion();
+    cam.getWorldQuaternion(camQ);
+
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ).normalize();
+    const pointOnPlane = camPos
+        .clone()
+        .add(forward.clone().multiplyScalar(drawDistanceRef.current));
 
     drawPlaneRef.current = { point: pointOnPlane, normal: forward };
 
@@ -311,8 +333,8 @@ export default function ARScene() {
       return;
     }
 
-    // ✅ snap su muro/porta (yaw-only, faccia verso camera)
-    const { rect, didSnap } = snapRectToViewerHit(rect0);
+    // ✅ ORIENTAMENTO FRONTale: uso la superficie hittata durante il disegno
+    const { rect, didSnap } = snapRectFrontToLastSurface(rect0);
 
     const box = makeWindowBox(rect, {
       thickness: thicknessRef.current,
@@ -329,7 +351,12 @@ export default function ARScene() {
       try {
         const xrTransform = new XRRigidTransform(
             { x: rect.center.x, y: rect.center.y, z: rect.center.z },
-            { x: rect.quaternion.x, y: rect.quaternion.y, z: rect.quaternion.z, w: rect.quaternion.w }
+            {
+              x: rect.quaternion.x,
+              y: rect.quaternion.y,
+              z: rect.quaternion.z,
+              w: rect.quaternion.w,
+            }
         );
         const anchor = await (session as unknown as {
           requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor>;
@@ -342,7 +369,7 @@ export default function ARScene() {
     three.trail.reset();
     drawPlaneRef.current = null;
 
-    setStatus(didSnap ? "Incollato al muro/porta ✅" : "Creato (nessun piano trovato)");
+    setStatus(didSnap ? "Finestra frontale sul muro ✅" : "Creato (fallback plane)");
   }
 
   function updatePreview(points: THREE.Vector3[]) {
@@ -352,12 +379,52 @@ export default function ARScene() {
     const rect = fitVerticalRectFromStroke(points);
     if (!rect) return;
 
+    const { rect: snapped } = snapRectFrontToLastSurface(rect);
     three.preview.clear();
-    three.preview.add(makePreviewRect(rect, { color: COLORS[colorKey] }));
+    three.preview.add(makePreviewRect(snapped, { color: COLORS[colorKey] }));
     three.preview.visible = true;
   }
 
-  // ✅ punto da pixel: raycaster dal dito ∩ drawPlane
+  // ✅ 1) punto preciso da hit-test transient touchscreen (superficie reale)
+  function pointFromTouchHitTest(frame: XRFrame): THREE.Vector3 | null {
+    const refSpace = refSpaceRef.current;
+    const src = transientHitTestSourceRef.current;
+    if (!refSpace || !src) return null;
+
+    // API: frame.getHitTestResultsForTransientInput(source)
+    const getTransient = (frame as unknown as {
+      getHitTestResultsForTransientInput?: (s: XRHitTestSource) => Array<{
+        inputSource: XRInputSource;
+        results: XRHitTestResult[];
+      }>;
+    }).getHitTestResultsForTransientInput;
+
+    if (!getTransient) return null;
+
+    const transientResults = getTransient.call(frame, src);
+    if (!transientResults || transientResults.length === 0) return null;
+
+    // prendiamo il primo input attivo
+    for (const tr of transientResults) {
+      const results = tr.results;
+      if (!results || results.length === 0) continue;
+
+      const pose = results[0].getPose(refSpace);
+      if (!pose) continue;
+
+      const t = pose.transform;
+      const pos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
+      const q = new THREE.Quaternion(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+
+      // salvo per lo snap finale coerente
+      lastSurfaceHitRef.current = { position: pos.clone(), orientation: q.clone() };
+      return pos;
+    }
+
+    return null;
+  }
+
+  // ✅ 2) fallback: ray da pixel dito ∩ piano davanti camera
   function pointFromScreenOnDrawPlane(): THREE.Vector3 | null {
     const plane = drawPlaneRef.current;
     const renderer = rendererRef.current;
@@ -370,7 +437,7 @@ export default function ARScene() {
     const x = ((pointerRef.current.x - rect.left) / rect.width) * 2 - 1;
     const y = -(((pointerRef.current.y - rect.top) / rect.height) * 2 - 1);
 
-    const cam = renderer.xr.getCamera() as unknown as THREE.Camera;
+    const cam = getXRRenderCamera(renderer, three.camera);
 
     const raycaster = raycasterRef.current;
     raycaster.setFromCamera(new THREE.Vector2(x, y), cam);
@@ -381,48 +448,41 @@ export default function ARScene() {
     return intersectRayPlane(origin, dir, plane.point, plane.normal);
   }
 
-  // ✅ Snap “finestra”: verticale, yaw-only, faccia verso camera
-  function snapRectToViewerHit(rect: {
+  // ✅ Snap “finestra” frontale usando l'ultima superficie hittata durante il disegno:
+  // - verticale (no roll/pitch)
+  // - yaw-only
+  // - faccia verso camera
+  function snapRectFrontToLastSurface(rect: {
     center: THREE.Vector3;
     width: number;
     height: number;
     quaternion: THREE.Quaternion;
+    corners?: THREE.Vector3[];
   }): { rect: typeof rect; didSnap: boolean } {
-    const frame = lastFrameRef.current;
-    const refSpace = refSpaceRef.current;
-    const src = viewerHitTestSourceRef.current;
+    const hit = lastSurfaceHitRef.current;
     const renderer = rendererRef.current;
     const three = threeRef.current;
+    if (!hit || !renderer || !three) return { rect, didSnap: false };
 
-    if (!frame || !refSpace || !src || !frame.getHitTestResults || !renderer || !three) {
-      return { rect, didSnap: false };
-    }
+    const hitPos = hit.position.clone();
+    const hitQ = hit.orientation.clone();
 
-    const hits = frame.getHitTestResults(src);
-    if (!hits || hits.length === 0) return { rect, didSnap: false };
-
-    const pose = hits[0].getPose(refSpace);
-    if (!pose) return { rect, didSnap: false };
-
-    const t = pose.transform;
-    const hitPos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
-
-    const hitQ = new THREE.Quaternion(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
-
-    // normale del muro (da hit-test)
+    // forward della superficie (normale)
     let forward = new THREE.Vector3(0, 0, -1).applyQuaternion(hitQ).normalize();
 
-    // ✅ niente tilt: yaw-only
+    // yaw-only (niente tilt)
     forward.y = 0;
     if (forward.lengthSq() < 1e-8) {
-      const cam = renderer.xr.getCamera() as unknown as THREE.Camera;
-      forward = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+      const cam = getXRRenderCamera(renderer, three.camera);
+      const camQ = new THREE.Quaternion();
+      cam.getWorldQuaternion(camQ);
+      forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ);
       forward.y = 0;
     }
     forward.normalize();
 
-    // ✅ faccia larga verso camera
-    const cam = renderer.xr.getCamera() as unknown as THREE.Camera;
+    // faccia verso camera
+    const cam = getXRRenderCamera(renderer, three.camera);
     const camPos = new THREE.Vector3();
     cam.getWorldPosition(camPos);
 
@@ -491,6 +551,7 @@ export default function ARScene() {
     three.preview.visible = false;
     three.trail.reset();
     drawPlaneRef.current = null;
+    lastSurfaceHitRef.current = null;
 
     setStatus("Tutto cancellato.");
   }
@@ -582,14 +643,21 @@ export default function ARScene() {
           </div>
 
           <div className="pointer-events-none mt-2 text-xs text-white/80">
-            Tip: quando rilasci, tieni il vano al <b>centro schermo</b> per mezzo secondo → snap più affidabile.
+            Tip: se il muro è “agganciato” bene, il tratto rimane incollato e la finestra esce frontale.
           </div>
         </div>
       </div>
   );
 }
 
-/* ---------------- helpers ---------------- */
+// ---------------- helpers ----------------
+
+// ✅ camera corretta quando XR è attivo (evita sbarellamenti con ArrayCamera)
+function getXRRenderCamera(renderer: THREE.WebGLRenderer, baseCamera: THREE.Camera): THREE.Camera {
+  const xrCam = renderer.xr.getCamera(baseCamera) as unknown as THREE.Camera & { cameras?: THREE.Camera[] };
+  // In AR spesso è ArrayCamera: prendiamo la prima camera “reale”
+  return xrCam.cameras && xrCam.cameras.length > 0 ? xrCam.cameras[0] : xrCam;
+}
 
 function intersectRayPlane(
     rayOrigin: THREE.Vector3,
