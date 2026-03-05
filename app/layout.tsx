@@ -1,20 +1,24 @@
-// src/app/ar/layout.tsx
-import type { PropsWithChildren } from "react";
+// src/app/layout.tsx
+import type { ReactNode } from "react";
 
-export default function ARLayout({ children }: PropsWithChildren) {
+export default function RootLayout({ children }: { children: ReactNode }) {
     return (
-        <div
-            style={{
-                position: "fixed",
-                inset: 0,
-                width: "100vw",
-                height: "100vh",
-                overflow: "hidden",
-                background: "black",
-                touchAction: "none",
-            }}
-        >
-            {children}
-        </div>
+        <html lang="it" style={{ background: "transparent" }}>
+        <head>
+            <style>{`
+          html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background: transparent;
+          }
+          body {
+            overscroll-behavior: none;
+          }
+        `}</style>
+        </head>
+        <body style={{ background: "transparent" }}>{children}</body>
+        </html>
     );
 }
