@@ -47,46 +47,33 @@ export default function ARScene() {
 
   // viewer hit-test (centro schermo) → stima distanza reale al muro
   const viewerHitTestSourceRef = useRef<XRHitTestSource | null>(null);
-
-  // stima distanza “auto” (smoothed)
   const autoDistRef = useRef<number | null>(null);
 
-  // Anchors (opzionale)
+  // Anchors
   const anchorsSupportedRef = useRef(false);
   const anchoredRef = useRef<Anchored[]>([]);
   const placedRef = useRef<THREE.Object3D[]>([]);
 
   const [colorKey, setColorKey] = useState<ColorKey>("magenta");
   const thicknessRef = useRef(0.06);
-
-  // fallback distanza se hit-test non becca
   const drawDistanceRef = useRef(1.2);
 
   // piano di disegno (frontale camera) bloccato all’inizio del drag
   const drawPlaneRef = useRef<Plane | null>(null);
+  const planeAxesRef = useRef<{ right: THREE.Vector3; up: THREE.Vector3; forward: THREE.Vector3 } | null>(null);
 
-  // assi del piano (right/up) bloccati al down
-  const planeAxesRef = useRef<{
-    right: THREE.Vector3;
-    up: THREE.Vector3;
-    forward: THREE.Vector3;
-  } | null>(null);
+  const dragRef = useRef<{ dragging: boolean; a: THREE.Vector3 | null; b: THREE.Vector3 | null }>({
+    dragging: false,
+    a: null,
+    b: null,
+  });
 
-  // rettangolo in drag: cornerA (down) + cornerB (current)
-  const dragRef = useRef<{
-    dragging: boolean;
-    a: THREE.Vector3 | null;
-    b: THREE.Vector3 | null;
-  }>({ dragging: false, a: null, b: null });
-
-  // puntatore (pixel dito)
   const pointerRef = useRef<{ x: number; y: number; active: boolean }>({
     x: 0,
     y: 0,
     active: false,
   });
 
-  // ✅ per gestire drag affidabile in XR
   const activePointerIdRef = useRef<number | null>(null);
 
   const raycasterRef = useRef(new THREE.Raycaster());
@@ -104,17 +91,19 @@ export default function ARScene() {
     renderer.setClearColor(0x000000, 0);
     renderer.setClearAlpha(0);
 
-    // ✅ canvas full overlay e allineato
+    // canvas overlay
     renderer.domElement.style.position = "absolute";
     renderer.domElement.style.inset = "0";
     renderer.domElement.style.width = "100%";
     renderer.domElement.style.height = "100%";
     renderer.domElement.style.display = "block";
 
-    // ✅ UI: canvas non deve intercettare click/touch
+    // UI: canvas non prende eventi
     renderer.domElement.style.pointerEvents = "none";
     renderer.domElement.style.zIndex = "0";
+
     container.style.position = "relative";
+    container.style.pointerEvents = "auto";
 
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
@@ -145,7 +134,6 @@ export default function ARScene() {
       const rect = container.getBoundingClientRect();
       const w = Math.max(1, Math.floor(rect.width));
       const h = Math.max(1, Math.floor(rect.height));
-
       renderer.setSize(w, h, true);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     });
@@ -172,6 +160,176 @@ export default function ARScene() {
     setGroupColor(three.preview, COLORS[colorKey]);
   }, [colorKey]);
 
+  // ✅ Listener DOM nativi quando AR è running (React events in dom-overlay possono fallire)
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    if (!isRunning) return;
+
+    const onDown = (ev: PointerEvent) => {
+      // non iniziare se tocchi controlli UI
+      const target = ev.target as HTMLElement | null;
+      if (target?.closest?.("button,select,input,textarea,label,a")) return;
+
+      ev.preventDefault();
+
+      activePointerIdRef.current = ev.pointerId;
+      try {
+        el.setPointerCapture(ev.pointerId);
+      } catch {}
+
+      pointerRef.current = { x: ev.clientX, y: ev.clientY, active: true };
+      previewThrottleRef.current = 0;
+
+      const renderer = rendererRef.current!;
+      const cam = getXRRenderCamera(renderer);
+
+      const camPos = new THREE.Vector3();
+      cam.getWorldPosition(camPos);
+
+      const camQ = new THREE.Quaternion();
+      cam.getWorldQuaternion(camQ);
+
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ).normalize();
+      const forwardYaw = forward.clone();
+      forwardYaw.y = 0;
+      if (forwardYaw.lengthSq() < 1e-8) forwardYaw.set(0, 0, -1);
+      forwardYaw.normalize();
+
+      const dist = clamp(autoDistRef.current ?? drawDistanceRef.current, 0.35, 4.0);
+
+      const pointOnPlane = camPos.clone().add(forwardYaw.clone().multiplyScalar(dist));
+      drawPlaneRef.current = { point: pointOnPlane, normal: forwardYaw };
+
+      const up = new THREE.Vector3(0, 1, 0);
+      let right = new THREE.Vector3().crossVectors(up, forwardYaw);
+      if (right.lengthSq() < 1e-8) right = new THREE.Vector3(1, 0, 0);
+      right.normalize();
+
+      planeAxesRef.current = { right, up, forward: forwardYaw };
+
+      const a = pointFromScreenOnDrawPlane();
+      dragRef.current = { dragging: true, a, b: a };
+
+      const three = threeRef.current!;
+      three.trail.reset();
+      three.preview.clear();
+      three.preview.visible = true;
+
+      if (a) three.trail.pushPoint(a);
+      setStatus(`Drag… (piano ~${dist.toFixed(2)}m, auto:${autoDistRef.current ? "si" : "no"})`);
+    };
+
+    const onMove = (ev: PointerEvent) => {
+      if (activePointerIdRef.current !== ev.pointerId) return;
+      if (!pointerRef.current.active) return;
+      ev.preventDefault();
+      pointerRef.current.x = ev.clientX;
+      pointerRef.current.y = ev.clientY;
+    };
+
+    const onUp = async (ev: PointerEvent) => {
+      if (activePointerIdRef.current !== ev.pointerId) return;
+      ev.preventDefault();
+
+      try {
+        el.releasePointerCapture(ev.pointerId);
+      } catch {}
+
+      activePointerIdRef.current = null;
+      pointerRef.current.active = false;
+
+      const three = threeRef.current!;
+      three.preview.visible = false;
+      three.preview.clear();
+
+      const a = dragRef.current.a;
+      const b = dragRef.current.b;
+      dragRef.current.dragging = false;
+
+      if (!a || !b || !planeAxesRef.current) {
+        setStatus("Drag non valido.");
+        three.trail.reset();
+        drawPlaneRef.current = null;
+        planeAxesRef.current = null;
+        return;
+      }
+
+      const rect = rectFromTwoPointsOnPlane(a, b, planeAxesRef.current);
+      if (rect.width < 0.05 || rect.height < 0.05) {
+        setStatus("Rettangolo troppo piccolo.");
+        three.trail.reset();
+        drawPlaneRef.current = null;
+        planeAxesRef.current = null;
+        return;
+      }
+
+      const box = makeWindowBox(rect, {
+        thickness: thicknessRef.current,
+        color: COLORS[colorKey],
+      });
+
+      three.root.add(box);
+      placedRef.current.push(box);
+
+      const session = sessionRef.current;
+      const refSpace = refSpaceRef.current;
+      if (session && refSpace && anchorsSupportedRef.current) {
+        try {
+          const xrTransform = new XRRigidTransform(
+              { x: rect.center.x, y: rect.center.y, z: rect.center.z },
+              { x: rect.quaternion.x, y: rect.quaternion.y, z: rect.quaternion.z, w: rect.quaternion.w }
+          );
+          const anchor = await (session as unknown as {
+            requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor>;
+          }).requestAnchor(xrTransform, refSpace);
+
+          anchoredRef.current.push({ anchor, obj: box });
+        } catch {}
+      }
+
+      three.trail.reset();
+      drawPlaneRef.current = null;
+      planeAxesRef.current = null;
+
+      setStatus("Creato ✅ (rettangolo parte dal dito)");
+    };
+
+    const onCancel = (ev: PointerEvent) => {
+      if (activePointerIdRef.current !== ev.pointerId) return;
+
+      activePointerIdRef.current = null;
+      pointerRef.current.active = false;
+      dragRef.current.dragging = false;
+
+      const three = threeRef.current;
+      if (three) {
+        three.preview.visible = false;
+        three.preview.clear();
+        three.trail.reset();
+      }
+
+      drawPlaneRef.current = null;
+      planeAxesRef.current = null;
+
+      setStatus("Drag annullato (pointercancel)");
+    };
+
+    el.addEventListener("pointerdown", onDown, { passive: false });
+    el.addEventListener("pointermove", onMove, { passive: false });
+    el.addEventListener("pointerup", onUp, { passive: false });
+    el.addEventListener("pointercancel", onCancel, { passive: false });
+
+    return () => {
+      el.removeEventListener("pointerdown", onDown as any);
+      el.removeEventListener("pointermove", onMove as any);
+      el.removeEventListener("pointerup", onUp as any);
+      el.removeEventListener("pointercancel", onCancel as any);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRunning, colorKey]);
+
   async function startAR() {
     if (isRunning) return;
 
@@ -191,8 +349,7 @@ export default function ARScene() {
 
     sessionRef.current = session;
     anchorsSupportedRef.current =
-        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor ===
-        "function";
+        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor === "function";
 
     const renderer = rendererRef.current!;
     await renderer.xr.setSession(session);
@@ -244,18 +401,14 @@ export default function ARScene() {
       const refSpaceNow = refSpaceRef.current!;
       const rendererNow = rendererRef.current!;
 
-      // 1) distanza automatica
+      // auto distance dal viewer hit-test
       if (frame && viewerHitTestSourceRef.current && refSpaceNow) {
         const hits = frame.getHitTestResults(viewerHitTestSourceRef.current);
         if (hits && hits.length > 0) {
           const pose = hits[0].getPose(refSpaceNow);
           if (pose) {
             const t = pose.transform;
-            const hitPos = new THREE.Vector3(
-                t.position.x,
-                t.position.y,
-                t.position.z
-            );
+            const hitPos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
 
             const cam = getXRRenderCamera(rendererNow);
             const camPos = new THREE.Vector3();
@@ -263,15 +416,13 @@ export default function ARScene() {
 
             const rawDist = camPos.distanceTo(hitPos);
             const clamped = clamp(rawDist, 0.35, 4.0);
-
             const prev = autoDistRef.current;
-            autoDistRef.current =
-                prev == null ? clamped : prev * 0.85 + clamped * 0.15;
+            autoDistRef.current = prev == null ? clamped : prev * 0.85 + clamped * 0.15;
           }
         }
       }
 
-      // 2) aggiorna B e preview durante drag
+      // preview update
       if (frame && dragRef.current.dragging && pointerRef.current.active) {
         const b = pointFromScreenOnDrawPlane();
         if (b) {
@@ -284,19 +435,14 @@ export default function ARScene() {
         }
       }
 
-      // 3) ancore
+      // anchor update
       if (frame && refSpaceNow) {
         for (const item of anchoredRef.current) {
           const pose = frame.getPose(item.anchor.anchorSpace, refSpaceNow);
           if (!pose) continue;
           const t = pose.transform;
           item.obj.position.set(t.position.x, t.position.y, t.position.z);
-          item.obj.quaternion.set(
-              t.orientation.x,
-              t.orientation.y,
-              t.orientation.z,
-              t.orientation.w
-          );
+          item.obj.quaternion.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
         }
       }
 
@@ -306,161 +452,6 @@ export default function ARScene() {
 
   function stopAR() {
     sessionRef.current?.end();
-  }
-
-  function onPointerDown(e: React.PointerEvent) {
-    if (!isRunning) return;
-
-    // non partire se tocchi UI
-    if ((e.target as HTMLElement).closest("button,select,input,textarea,label,a")) return;
-
-    e.preventDefault();
-
-    // ✅ pointer capture (drag affidabile)
-    activePointerIdRef.current = e.pointerId;
-    try {
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    } catch {}
-
-    pointerRef.current = { x: e.clientX, y: e.clientY, active: true };
-    previewThrottleRef.current = 0;
-
-    const renderer = rendererRef.current!;
-    const cam = getXRRenderCamera(renderer);
-
-    const camPos = new THREE.Vector3();
-    cam.getWorldPosition(camPos);
-
-    const camQ = new THREE.Quaternion();
-    cam.getWorldQuaternion(camQ);
-
-    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ).normalize();
-
-    const forwardYaw = forward.clone();
-    forwardYaw.y = 0;
-    if (forwardYaw.lengthSq() < 1e-8) forwardYaw.set(0, 0, -1);
-    forwardYaw.normalize();
-
-    const dist = clamp(autoDistRef.current ?? drawDistanceRef.current, 0.35, 4.0);
-
-    const pointOnPlane = camPos.clone().add(forwardYaw.clone().multiplyScalar(dist));
-    drawPlaneRef.current = { point: pointOnPlane, normal: forwardYaw };
-
-    const up = new THREE.Vector3(0, 1, 0);
-    let right = new THREE.Vector3().crossVectors(up, forwardYaw);
-    if (right.lengthSq() < 1e-8) right = new THREE.Vector3(1, 0, 0);
-    right.normalize();
-
-    planeAxesRef.current = { right, up, forward: forwardYaw };
-
-    const a = pointFromScreenOnDrawPlane();
-    dragRef.current = { dragging: true, a, b: a };
-
-    const three = threeRef.current!;
-    three.trail.reset();
-    three.preview.clear();
-    three.preview.visible = true;
-
-    if (a) three.trail.pushPoint(a);
-    setStatus(`Drag… (piano ~${dist.toFixed(2)}m, auto:${autoDistRef.current ? "si" : "no"})`);
-  }
-
-  function onPointerMove(e: React.PointerEvent) {
-    if (!isRunning) return;
-    if (activePointerIdRef.current !== e.pointerId) return;
-    if (!pointerRef.current.active) return;
-
-    e.preventDefault();
-    pointerRef.current.x = e.clientX;
-    pointerRef.current.y = e.clientY;
-  }
-
-  async function onPointerUp(e: React.PointerEvent) {
-    if (!isRunning) return;
-    if (activePointerIdRef.current !== e.pointerId) return;
-
-    e.preventDefault();
-
-    try {
-      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    } catch {}
-
-    activePointerIdRef.current = null;
-    pointerRef.current.active = false;
-
-    const three = threeRef.current!;
-    three.preview.visible = false;
-    three.preview.clear();
-
-    const a = dragRef.current.a;
-    const b = dragRef.current.b;
-    dragRef.current.dragging = false;
-
-    if (!a || !b || !planeAxesRef.current) {
-      setStatus("Drag non valido.");
-      three.trail.reset();
-      drawPlaneRef.current = null;
-      planeAxesRef.current = null;
-      return;
-    }
-
-    const rect = rectFromTwoPointsOnPlane(a, b, planeAxesRef.current);
-    if (rect.width < 0.05 || rect.height < 0.05) {
-      setStatus("Rettangolo troppo piccolo.");
-      three.trail.reset();
-      drawPlaneRef.current = null;
-      planeAxesRef.current = null;
-      return;
-    }
-
-    const box = makeWindowBox(rect, {
-      thickness: thicknessRef.current,
-      color: COLORS[colorKey],
-    });
-
-    three.root.add(box);
-    placedRef.current.push(box);
-
-    const session = sessionRef.current;
-    const refSpace = refSpaceRef.current;
-    if (session && refSpace && anchorsSupportedRef.current) {
-      try {
-        const xrTransform = new XRRigidTransform(
-            { x: rect.center.x, y: rect.center.y, z: rect.center.z },
-            { x: rect.quaternion.x, y: rect.quaternion.y, z: rect.quaternion.z, w: rect.quaternion.w }
-        );
-        const anchor = await (session as unknown as {
-          requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor>;
-        }).requestAnchor(xrTransform, refSpace);
-
-        anchoredRef.current.push({ anchor, obj: box });
-      } catch {}
-    }
-
-    three.trail.reset();
-    drawPlaneRef.current = null;
-    planeAxesRef.current = null;
-
-    setStatus("Creato ✅ (rettangolo parte dal dito)");
-  }
-
-  function onPointerCancel(e: React.PointerEvent) {
-    if (activePointerIdRef.current !== e.pointerId) return;
-
-    activePointerIdRef.current = null;
-    pointerRef.current.active = false;
-    dragRef.current.dragging = false;
-
-    const three = threeRef.current;
-    if (three) {
-      three.preview.visible = false;
-      three.preview.clear();
-      three.trail.reset();
-    }
-
-    drawPlaneRef.current = null;
-    planeAxesRef.current = null;
-    setStatus("Drag annullato (pointercancel)");
   }
 
   function updatePreviewFromDrag() {
@@ -494,9 +485,7 @@ export default function ARScene() {
     const py = (pointerRef.current.y - canvasRect.top) * dpr;
 
     const xrCam = (renderer.xr as unknown as {
-      getCamera: () => THREE.Camera & {
-        cameras?: Array<THREE.Camera & { viewport?: THREE.Vector4 }>;
-      };
+      getCamera: () => THREE.Camera & { cameras?: Array<THREE.Camera & { viewport?: THREE.Vector4 }> };
     }).getCamera();
 
     const cam: THREE.Camera & { viewport?: THREE.Vector4 } =
@@ -584,10 +573,6 @@ export default function ARScene() {
           ref={containerRef}
           className="absolute inset-0"
           style={{ touchAction: "none" }}
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={onPointerUp}
-          onPointerCancel={onPointerCancel}
       >
         <div className="pointer-events-none absolute left-3 top-3 z-10 max-w-[560px]">
           <div className="pointer-events-none mb-2 text-sm text-white [text-shadow:_0_1px_2px_rgba(0,0,0,0.85)]">
@@ -672,7 +657,7 @@ export default function ARScene() {
           </div>
 
           <div className="pointer-events-none mt-2 text-xs text-white/80">
-            UI ok + drag ok (pointer capture) ✅
+            Drag gestito via event listener DOM nativi ✅
           </div>
         </div>
       </div>
@@ -689,7 +674,6 @@ function getXRRenderCamera(renderer: THREE.WebGLRenderer): THREE.Camera {
   const xrCam = (renderer.xr as unknown as {
     getCamera: () => THREE.Camera & { cameras?: THREE.Camera[] };
   }).getCamera();
-
   return xrCam.cameras && xrCam.cameras.length > 0 ? xrCam.cameras[0] : xrCam;
 }
 
@@ -712,7 +696,6 @@ function rectFromTwoPointsOnPlane(
     axes: { right: THREE.Vector3; up: THREE.Vector3; forward: THREE.Vector3 }
 ): { center: THREE.Vector3; width: number; height: number; quaternion: THREE.Quaternion } {
   const d = b.clone().sub(a);
-
   const dx = d.dot(axes.right);
   const dy = d.dot(axes.up);
 
