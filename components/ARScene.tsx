@@ -20,6 +20,8 @@
  *    movement during drawing.
  *  • The draw-plane is always vertical (forward.y = 0) so placed boxes never
  *    tilt with camera pitch.
+ *  • UI controls use bubbling-phase stopPropagation (NOT capture-phase) so
+ *    pointer events reach the buttons before being blocked from the canvas.
  *  • XR anchors are requested when available (best-effort, non-fatal).
  */
 
@@ -32,21 +34,25 @@ import { makeGoldenTrail } from "@/server-utils/lib/fx/goldenTrail";
 type ColorKey = "gold" | "cyan" | "magenta" | "white";
 type Phase    = "idle" | "drawing" | "processing";
 
-/** Camera state frozen at pointer-down; used for stable unprojection. */
+/**
+ * Camera state frozen at pointer-down.
+ * All unprojection during a gesture uses this snapshot so results are
+ * independent of head movement while drawing.
+ */
 interface FrozenCamera {
   /** Active XR eye camera (or fallback perspective camera). */
   cam:        THREE.Camera;
-  /** World-space camera position at the moment of pointer-down. */
+  /** World-space camera position at pointer-down. */
   pos:        THREE.Vector3;
   /**
-   * Yaw-only (horizontal) unit forward vector derived from camera orientation.
-   * Keeping Y = 0 ensures the draw-plane stays strictly vertical even when
+   * Yaw-only (Y = 0) unit forward vector derived from camera orientation.
+   * Keeping Y = 0 ensures the draw-plane is strictly vertical even when
    * the user tilts their head.
    */
   forward:    THREE.Vector3;
-  /** A point on the draw-plane (camPos + forward × drawDistance). */
+  /** A point on the draw-plane (pos + forward × drawDistance). */
   planePoint: THREE.Vector3;
-  /** Container pixel dimensions at pointer-down (used for NDC conversion). */
+  /** Container pixel dimensions at pointer-down (for NDC conversion). */
   containerW: number;
   containerH: number;
 }
@@ -71,7 +77,7 @@ const MIN_BOX_SIDE_M     = 0.04;
 const STROKE_MIN_DELTA   = 2;
 /** React state for the SVG overlay is updated at most this often (ms). */
 const STROKE_THROTTLE_MS = 30;
-/** Brief visual pause between "drawing" and "idle" so the user sees feedback. */
+/** Brief visual pause between "processing" feedback and placing the box. */
 const PROCESSING_DELAY   = 200;
 /** Maximum devicePixelRatio forwarded to the renderer. */
 const MAX_DPR            = 2;
@@ -103,9 +109,8 @@ function disposeObject(root: THREE.Object3D): void {
 }
 
 /**
- * Returns the active XR eye camera from the renderer.
- * Falls back to the scene's perspective camera when not in XR or when
- * the XR camera array is empty.
+ * Returns the active XR eye camera.
+ * Falls back to the scene's perspective camera when not in XR.
  */
 function getXRCamera(renderer: THREE.WebGLRenderer, fallback: THREE.Camera): THREE.Camera {
   const xrCam = (renderer.xr as unknown as {
@@ -117,7 +122,7 @@ function getXRCamera(renderer: THREE.WebGLRenderer, fallback: THREE.Camera): THR
 /**
  * Ray–plane intersection.
  * Returns the world-space hit point, or null when the ray is parallel to or
- * behind the plane.
+ * points away from the plane.
  */
 function rayPlaneIntersect(
     origin:      THREE.Vector3,
@@ -153,12 +158,12 @@ function unprojectOntoPlane(
 // ─────────────────────────── 3-D builders ────────────────────────────────────
 
 /**
- * Builds a translucent rectangular box mesh (window / door / frame style).
+ * Builds a translucent rectangular box (window / door / frame style).
  *
- * Orientation:
- *   right   = worldUp × forward  (horizontal axis on the wall)
- *   up      = forward × right    (vertical axis, close to world-up)
- *   forward = provided forward   (face normal, pointing toward camera)
+ * Local axes:
+ *   right   = worldUp × forward   (horizontal axis on the wall)
+ *   up      = forward × right     (close to worldUp)
+ *   forward = provided arg        (face normal, pointing toward camera)
  */
 function makeWindowBox(opts: {
   center:    THREE.Vector3;
@@ -179,7 +184,6 @@ function makeWindowBox(opts: {
   );
 
   const geom = new THREE.BoxGeometry(width, height, thickness);
-
   const mesh = new THREE.Mesh(
       geom,
       new THREE.MeshStandardMaterial({
@@ -193,7 +197,6 @@ function makeWindowBox(opts: {
   );
   mesh.position.copy(center);
   mesh.quaternion.copy(quaternion);
-
   mesh.add(
       new THREE.LineSegments(
           new THREE.EdgesGeometry(geom),
@@ -208,14 +211,11 @@ function makeWindowBox(opts: {
 function tintObject(root: THREE.Object3D, color: number): void {
   root.traverse((obj) => {
     const o = obj as unknown as { material?: unknown };
-    if (Array.isArray(o.material)) {
-      o.material.forEach((m) => {
-        if (hasMaterialColor(m)) { m.color.setHex(color); m.needsUpdate = true; }
-      });
-    } else if (hasMaterialColor(o.material)) {
-      o.material.color.setHex(color);
-      o.material.needsUpdate = true;
-    }
+    const tint = (m: unknown) => {
+      if (hasMaterialColor(m)) { m.color.setHex(color); m.needsUpdate = true; }
+    };
+    if (Array.isArray(o.material)) o.material.forEach(tint);
+    else tint(o.material);
   });
 }
 
@@ -247,7 +247,7 @@ export default function ARScene() {
   const thicknessRef       = useRef(0.06);
   const drawDistanceRef    = useRef(1.6);
 
-  /** Raw 2-D stroke points in container-local pixels. */
+  /** Raw 2-D stroke in container-local pixels, accumulated during a gesture. */
   const stroke2DRef       = useRef<{ x: number; y: number }[]>([]);
   const strokeThrottleRef = useRef(0);
 
@@ -259,16 +259,26 @@ export default function ARScene() {
   const [colorKey,  setColorKey]  = useState<ColorKey>("magenta");
   const [stroke2D,  setStroke2D]  = useState<{ x: number; y: number }[]>([]);
 
-  // ── Three.js setup ────────────────────────────────────────────────────────
+  // ── Three.js bootstrap ────────────────────────────────────────────────────
 
   useEffect(() => {
     const container = containerRef.current!;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+    const renderer = new THREE.WebGLRenderer({
+      antialias:       true,
+      alpha:           true,
+      powerPreference: "high-performance",
+    });
     renderer.xr.enabled = true;
     renderer.setClearColor(0x000000, 0);
     renderer.setClearAlpha(0);
-    Object.assign(renderer.domElement.style, { position: "absolute", inset: "0", width: "100%", height: "100%", zIndex: "0" });
+    Object.assign(renderer.domElement.style, {
+      position: "absolute",
+      inset:    "0",
+      width:    "100%",
+      height:   "100%",
+      zIndex:   "0",
+    });
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -302,7 +312,7 @@ export default function ARScene() {
     };
   }, []);
 
-  // Keep trail colour in sync.
+  // Keep trail colour in sync with colorKey.
   useEffect(() => { threeRef.current?.trail.setColor(COLORS[colorKey]); }, [colorKey]);
 
   // ── AR session lifecycle ───────────────────────────────────────────────────
@@ -313,7 +323,6 @@ export default function ARScene() {
     if (!xr) { setStatus("WebXR non disponibile su questo dispositivo."); return; }
 
     setStatus("Avvio sessione AR…");
-
     const session = await xr.requestSession("immersive-ar", {
       requiredFeatures: ["hit-test"],
       optionalFeatures: ["anchors", "dom-overlay", "local-floor"],
@@ -337,7 +346,6 @@ export default function ARScene() {
 
     renderer.setAnimationLoop((_time, frame) => {
       const three = threeRef.current!;
-      // Update world-locked anchor poses every frame.
       if (frame && refSpaceRef.current) {
         for (const { anchor, obj } of anchoredRef.current) {
           const pose = frame.getPose(anchor.anchorSpace, refSpaceRef.current);
@@ -354,13 +362,13 @@ export default function ARScene() {
   function stopAR() { sessionRef.current?.end(); }
 
   function handleSessionEnd() {
-    refSpaceRef.current       = null;
-    sessionRef.current        = null;
-    anchoredRef.current       = [];
-    placedRef.current         = [];
-    frozenCamRef.current      = null;
+    refSpaceRef.current        = null;
+    sessionRef.current         = null;
+    anchoredRef.current        = [];
+    placedRef.current          = [];
+    frozenCamRef.current       = null;
     activePointerIdRef.current = null;
-    stroke2DRef.current       = [];
+    stroke2DRef.current        = [];
     setStroke2D([]);
     threeRef.current?.trail.reset();
     setIsRunning(false);
@@ -368,17 +376,24 @@ export default function ARScene() {
     setStatus("Sessione AR terminata.");
   }
 
-  // ── Pointer events ─────────────────────────────────────────────────────────
+  // ── Canvas pointer events ──────────────────────────────────────────────────
+  //
+  // The container handles drawing gestures.  UI buttons stop propagation in
+  // the BUBBLING phase (see controls wrapper below), so events reach the
+  // buttons first, fire onClick, then bubble up — and are stopped before they
+  // trigger a draw stroke.  The .closest() guard below is a second layer of
+  // safety for any path where stopPropagation was not called.
 
   function onPointerDown(e: React.PointerEvent) {
     if (!isRunning || phase === "processing") return;
+    // Safety guard: ignore events whose target is an interactive UI element.
     if ((e.target as HTMLElement).closest("button,select,input,textarea,label,a")) return;
     e.preventDefault();
 
     activePointerIdRef.current = e.pointerId;
     try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); } catch { /* ok */ }
 
-    // ── Snapshot the camera so the full gesture uses a consistent projection.
+    // ── Freeze camera state for this gesture ──────────────────────────────
     const renderer  = rendererRef.current!;
     const three     = threeRef.current!;
     const container = containerRef.current!;
@@ -389,7 +404,7 @@ export default function ARScene() {
     cam.getWorldPosition(pos);
     cam.getWorldQuaternion(q);
 
-    // Yaw-only forward → vertical draw-plane regardless of camera pitch.
+    // Zero out Y so the plane is always vertical regardless of camera pitch.
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
     forward.y = 0;
     if (forward.lengthSq() < 1e-6) forward.set(0, 0, -1);
@@ -461,7 +476,7 @@ export default function ARScene() {
     const three  = threeRef.current!;
     if (!frozen) { setStatus("Errore interno — riprova."); resetDraw(); return; }
 
-    // ── 2-D bounding-box of the stroke ──
+    // ── 2-D bounding-box of the stroke ────────────────────────────────────
     let minX = Infinity, maxX = -Infinity;
     let minY = Infinity, maxY = -Infinity;
     for (const { x, y } of pts) {
@@ -473,7 +488,7 @@ export default function ARScene() {
     const unp = (sx: number, sy: number) =>
         unprojectOntoPlane(sx, sy, containerW, containerH, cam, planePoint, forward);
 
-    // Unproject the 4 corners of the 2-D bbox onto the frozen vertical 3-D plane.
+    // Unproject the 4 bbox corners onto the frozen vertical draw-plane.
     const TL = unp(minX, minY);
     const TR = unp(maxX, minY);
     const BL = unp(minX, maxY);
@@ -498,10 +513,11 @@ export default function ARScene() {
         .add(TL).add(TR).add(BL).add(BR)
         .multiplyScalar(0.25);
 
-    // Ensure the box face points toward the camera.
+    // Ensure the box face always points toward the camera.
     const facingForward = forward.clone();
     if (facingForward.dot(camPos.clone().sub(center)) < 0) facingForward.negate();
 
+    // ── Place box ─────────────────────────────────────────────────────────
     const mesh = makeWindowBox({
       center, width, height,
       thickness: thicknessRef.current,
@@ -511,7 +527,7 @@ export default function ARScene() {
     three.root.add(mesh);
     placedRef.current.push(mesh);
 
-    // World-lock via XR anchor (best-effort — non-fatal if unavailable).
+    // World-lock via XR anchor (best-effort).
     const session  = sessionRef.current;
     const refSpace = refSpaceRef.current;
     if (session && refSpace && anchorsSupportedRef.current) {
@@ -576,13 +592,11 @@ export default function ARScene() {
 
   // ── SVG overlay data ───────────────────────────────────────────────────────
 
-  /** SVG "d" attribute for the free-hand highlighter path. */
   const strokePath = useMemo(() => {
     if (stroke2D.length < 2) return "";
     return "M " + stroke2D.map(({ x, y }) => `${x.toFixed(1)} ${y.toFixed(1)}`).join(" L ");
   }, [stroke2D]);
 
-  /** Live bounding-box shown as a dashed rectangle while drawing. */
   const bboxRect = useMemo(() => {
     if (phase !== "drawing" || stroke2D.length < 2) return null;
     let minX = Infinity, maxX = -Infinity;
@@ -613,7 +627,6 @@ export default function ARScene() {
             width="100%"
             height="100%"
         >
-          {/* Yellow translucent highlighter */}
           <path
               d={strokePath}
               fill="none"
@@ -622,7 +635,6 @@ export default function ARScene() {
               strokeLinecap="round"
               strokeLinejoin="round"
           />
-          {/* Dashed bounding-box preview */}
           {bboxRect && (
               <rect
                   x={bboxRect.x} y={bboxRect.y}
@@ -638,7 +650,6 @@ export default function ARScene() {
         {/* ── HUD ── */}
         <div className="pointer-events-none absolute left-3 top-3 z-20 max-w-[580px]">
 
-          {/* Status line */}
           <p className="mb-2 text-sm text-white drop-shadow-md">
             {status}
             {phase === "processing" && (
@@ -647,14 +658,23 @@ export default function ARScene() {
           </p>
 
           {/*
-          Controls wrapper: stopPropagation on all pointer events so that
-          tapping a button never accidentally starts a draw stroke.
+          IMPORTANT — event isolation strategy:
+          ───────────────────────────────────────
+          We stop pointer events in the BUBBLING phase here (onPointerDown,
+          not onPointerDownCapture).  This means:
+            1. The event travels DOWN through the DOM (capture phase) and
+               reaches the buttons — onClick fires correctly.
+            2. The event then bubbles UP and is stopped here, before it can
+               reach the container's onPointerDown and accidentally start a
+               draw stroke.
+          Using the *capture* phase (onPointerDownCapture) was the bug in a
+          previous version: it prevented events from ever reaching the buttons.
         */}
           <div
               className="pointer-events-auto flex flex-wrap gap-2"
-              onPointerDownCapture={(e) => e.stopPropagation()}
-              onPointerMoveCapture={(e) => e.stopPropagation()}
-              onPointerUpCapture={(e)   => e.stopPropagation()}
+              onPointerDown={(e) => e.stopPropagation()}
+              onPointerMove={(e) => e.stopPropagation()}
+              onPointerUp={(e)   => e.stopPropagation()}
           >
             {(
                 [
@@ -674,7 +694,6 @@ export default function ARScene() {
                 </button>
             ))}
 
-            {/* ── Colour picker ── */}
             <label className="flex items-center gap-1.5 rounded-lg border border-white/20 bg-black/40 px-2.5 py-1.5 backdrop-blur">
               <span className="text-xs text-white opacity-75">Colore</span>
               <select
@@ -683,7 +702,6 @@ export default function ARScene() {
                   onChange={(e) => {
                     const key = e.target.value as ColorKey;
                     setColorKey(key);
-                    // Update already-placed boxes so the colour feels live.
                     placedRef.current.forEach((obj) => tintObject(obj, COLORS[key]));
                   }}
               >
@@ -694,7 +712,6 @@ export default function ARScene() {
               </select>
             </label>
 
-            {/* ── Frame thickness ── */}
             <label className="flex items-center gap-1.5 rounded-lg border border-white/20 bg-black/40 px-2.5 py-1.5 backdrop-blur">
               <span className="text-xs text-white opacity-75">Spessore</span>
               <input
@@ -704,7 +721,6 @@ export default function ARScene() {
               />
             </label>
 
-            {/* ── Draw distance ── */}
             <label className="flex items-center gap-1.5 rounded-lg border border-white/20 bg-black/40 px-2.5 py-1.5 backdrop-blur">
               <span className="text-xs text-white opacity-75">Distanza</span>
               <input
