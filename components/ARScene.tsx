@@ -2,8 +2,11 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
+import { makeGoldenTrail } from "@/server-utils/lib/fx/goldenTrail";
+import { fitVerticalRectFromStroke } from "@/server-utils/lib/geometry/planeRect";
 
 type Anchored = { anchor: XRAnchor; obj: THREE.Object3D };
+type DrawState = { drawing: boolean; pointsWorld: THREE.Vector3[] };
 
 type ColorKey = "gold" | "cyan" | "magenta" | "white";
 const COLORS: Record<ColorKey, number> = {
@@ -15,6 +18,7 @@ const COLORS: Record<ColorKey, number> = {
 
 type Plane = { point: THREE.Vector3; normal: THREE.Vector3 };
 
+// ---------------- type guards ----------------
 function isMaterialWithColor(
     m: unknown
 ): m is THREE.Material & { color: THREE.Color; needsUpdate: boolean } {
@@ -26,6 +30,7 @@ function isMaterialWithColor(
   );
 }
 
+// ---------------- component ----------------
 export default function ARScene() {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
@@ -34,6 +39,8 @@ export default function ARScene() {
     scene: THREE.Scene;
     camera: THREE.PerspectiveCamera;
     root: THREE.Group;
+    trail: ReturnType<typeof makeGoldenTrail>;
+    preview: THREE.Group;
   } | null>(null);
 
   const [status, setStatus] = useState("Pronto");
@@ -42,33 +49,49 @@ export default function ARScene() {
   const sessionRef = useRef<XRSession | null>(null);
   const refSpaceRef = useRef<XRReferenceSpace | null>(null);
 
-  // viewer hit-test (centro schermo) → stima distanza reale
-  const viewerHitTestSourceRef = useRef<XRHitTestSource | null>(null);
-  const autoDistRef = useRef<number | null>(null);
-
-  // Anchors (opzionale)
+  // Anchors
   const anchorsSupportedRef = useRef(false);
   const anchoredRef = useRef<Anchored[]>([]);
   const placedRef = useRef<THREE.Object3D[]>([]);
 
+  const drawRef = useRef<DrawState>({ drawing: false, pointsWorld: [] });
+
   const [colorKey, setColorKey] = useState<ColorKey>("magenta");
   const thicknessRef = useRef(0.06);
-  const drawDistanceRef = useRef(1.2);
 
-  // piano “muro finto” davanti camera, deciso al down
+  // fallback plane davanti (se non c'è hit-test touch)
   const drawPlaneRef = useRef<Plane | null>(null);
-  const planeAxesRef = useRef<{ right: THREE.Vector3; up: THREE.Vector3; forward: THREE.Vector3 } | null>(null);
+  const drawDistanceRef = useRef(1.6);
 
-  // input tracking robusto
+  // ✅ puntatore reale (pixel dito)
+  const pointerRef = useRef<{ x: number; y: number; active: boolean }>({
+    x: 0,
+    y: 0,
+    active: false,
+  });
+
+  // ✅ per drag affidabile in AR dom-overlay
   const activePointerIdRef = useRef<number | null>(null);
-  const pointerRef = useRef<{ x: number; y: number; active: boolean }>({ x: 0, y: 0, active: false });
-
-  // “evidenziatore” in 2D (punti in pixel, relativi al container)
-  const [strokePts, setStrokePts] = useState<Array<{ x: number; y: number }>>([]);
-  const strokePtsRef = useRef<Array<{ x: number; y: number }>>([]);
-  const drawingRef = useRef(false);
 
   const raycasterRef = useRef(new THREE.Raycaster());
+  const previewThrottleRef = useRef(0);
+
+  // ✅ transient hit-test per touchscreen (precisione massima)
+  const transientHitTestSourceRef = useRef<XRHitTestSource | null>(null);
+
+  // ✅ salvo l'ultimo hit valido mentre disegno (pos + rot della superficie)
+  const lastSurfaceHitRef = useRef<{
+    position: THREE.Vector3;
+    orientation: THREE.Quaternion;
+  } | null>(null);
+
+  // per update in loop
+  const lastFrameRef = useRef<XRFrame | null>(null);
+
+  // --- evidenziatore 2D (solo visuale) ---
+  const stroke2DRef = useRef<Array<{ x: number; y: number }>>([]);
+  const [stroke2D, setStroke2D] = useState<Array<{ x: number; y: number }>>([]);
+  const strokeThrottleRef = useRef(0);
 
   useEffect(() => {
     const container = containerRef.current!;
@@ -82,17 +105,6 @@ export default function ARScene() {
     renderer.setClearColor(0x000000, 0);
     renderer.setClearAlpha(0);
 
-    // canvas sempre full screen
-    renderer.domElement.style.position = "absolute";
-    renderer.domElement.style.inset = "0";
-    renderer.domElement.style.width = "100%";
-    renderer.domElement.style.height = "100%";
-    renderer.domElement.style.display = "block";
-
-    // IMPORTANTISSIMO: lascia input al DOM overlay, non al canvas
-    renderer.domElement.style.pointerEvents = "none";
-
-    container.style.position = "relative";
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -100,6 +112,7 @@ export default function ARScene() {
     scene.background = null;
 
     const camera = new THREE.PerspectiveCamera();
+
     const root = new THREE.Group();
     scene.add(root);
 
@@ -108,13 +121,22 @@ export default function ARScene() {
     dir.position.set(1, 2, 1);
     scene.add(dir);
 
-    threeRef.current = { scene, camera, root };
+    const trail = makeGoldenTrail({ color: COLORS[colorKey] });
+    root.add(trail.object);
+
+    const preview = new THREE.Group();
+    preview.visible = false;
+    root.add(preview);
+
+    threeRef.current = { scene, camera, root, trail, preview };
 
     const ro = new ResizeObserver(() => {
       const rect = container.getBoundingClientRect();
       const w = Math.max(1, Math.floor(rect.width));
       const h = Math.max(1, Math.floor(rect.height));
-      renderer.setSize(w, h, true);
+
+      // ✅ COME LA VERSIONE CHE “FUNZIONAVA”
+      renderer.setSize(w, h, false);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     });
     ro.observe(container);
@@ -130,7 +152,15 @@ export default function ARScene() {
         container.removeChild(renderer.domElement);
       } catch {}
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    const three = threeRef.current;
+    if (!three) return;
+    three.trail.setColor(COLORS[colorKey]);
+    setGroupColor(three.preview, COLORS[colorKey]);
+  }, [colorKey]);
 
   async function startAR() {
     if (isRunning) return;
@@ -151,26 +181,34 @@ export default function ARScene() {
 
     sessionRef.current = session;
     anchorsSupportedRef.current =
-        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor === "function";
+        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor ===
+        "function";
 
     const renderer = rendererRef.current!;
+    renderer.setClearColor(0x000000, 0);
+    renderer.setClearAlpha(0);
+
     await renderer.xr.setSession(session);
 
     const refSpace = await session.requestReferenceSpace("local");
     refSpaceRef.current = refSpace;
 
-    // viewer hit-test
+    // ✅ transient hit-test per touchscreen (il dito)
     try {
-      const viewerSpace = await session.requestReferenceSpace("viewer");
-      viewerHitTestSourceRef.current =
-          (await session.requestHitTestSource?.({ space: viewerSpace })) ?? null;
+      transientHitTestSourceRef.current =
+          (await (session as unknown as {
+            requestHitTestSourceForTransientInput?: (o: {
+              profile: string;
+            }) => Promise<XRHitTestSource>;
+          }).requestHitTestSourceForTransientInput?.({ profile: "generic-touchscreen" })) ?? null;
     } catch {
-      viewerHitTestSourceRef.current = null;
+      transientHitTestSourceRef.current = null;
     }
 
     session.addEventListener("end", () => {
-      viewerHitTestSourceRef.current = null;
-      autoDistRef.current = null;
+      transientHitTestSourceRef.current = null;
+      lastFrameRef.current = null;
+      lastSurfaceHitRef.current = null;
 
       refSpaceRef.current = null;
       sessionRef.current = null;
@@ -178,63 +216,372 @@ export default function ARScene() {
       anchoredRef.current = [];
       placedRef.current = [];
 
-      // reset stroke/input
+      const three = threeRef.current;
+      if (three) {
+        three.preview.clear();
+        three.preview.visible = false;
+        three.trail.reset();
+      }
+
+      drawPlaneRef.current = null;
+
+      // reset input/evidenziatore
       activePointerIdRef.current = null;
       pointerRef.current.active = false;
-      drawingRef.current = false;
-      strokePtsRef.current = [];
-      setStrokePts([]);
+      stroke2DRef.current = [];
+      setStroke2D([]);
 
       setIsRunning(false);
       setStatus("Sessione AR terminata");
     });
 
     setIsRunning(true);
-    setStatus("AR avviata. Evidenzia (giallo) e poi rilascia.");
+    setStatus("AR avviata. Evidenzia col dito (giallo) e rilascia.");
 
     renderer.setAnimationLoop((_time, frame) => {
       const three = threeRef.current!;
-      const refSpaceNow = refSpaceRef.current!;
-      const rendererNow = rendererRef.current!;
+      lastFrameRef.current = frame ?? null;
 
-      // aggiorna distanza auto
-      if (frame && viewerHitTestSourceRef.current && refSpaceNow) {
-        const hits = frame.getHitTestResults(viewerHitTestSourceRef.current);
-        if (hits && hits.length > 0) {
-          const pose = hits[0].getPose(refSpaceNow);
-          if (pose) {
-            const t = pose.transform;
-            const hitPos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
-            const cam = getXRRenderCamera(rendererNow);
-            const camPos = new THREE.Vector3();
-            cam.getWorldPosition(camPos);
+      // mentre disegni: punti REALI da transient hit-test (se possibile) altrimenti fallback plane
+      if (frame && drawRef.current.drawing) {
+        const pt = pointFromTouchHitTest(frame) ?? pointFromScreenOnDrawPlane();
+        if (pt) {
+          drawRef.current.pointsWorld.push(pt);
+          three.trail.pushPoint(pt);
 
-            const rawDist = camPos.distanceTo(hitPos);
-            const clamped = clamp(rawDist, 0.35, 4.0);
-            const prev = autoDistRef.current;
-            autoDistRef.current = prev == null ? clamped : prev * 0.85 + clamped * 0.15;
+          const now = performance.now();
+          if (now - previewThrottleRef.current > 40) {
+            previewThrottleRef.current = now;
+            updatePreview(drawRef.current.pointsWorld);
           }
         }
       }
 
-      // aggiorna ancore
-      if (frame && refSpaceNow) {
+      // aggiorno ancore
+      if (frame && refSpaceRef.current) {
         for (const item of anchoredRef.current) {
-          const pose = frame.getPose(item.anchor.anchorSpace, refSpaceNow);
+          const pose = frame.getPose(item.anchor.anchorSpace, refSpaceRef.current);
           if (!pose) continue;
           const t = pose.transform;
           item.obj.position.set(t.position.x, t.position.y, t.position.z);
-          item.obj.quaternion.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+          item.obj.quaternion.set(
+              t.orientation.x,
+              t.orientation.y,
+              t.orientation.z,
+              t.orientation.w
+          );
         }
       }
 
-      rendererNow.render(three.scene, three.camera);
+      renderer.render(three.scene, three.camera);
     });
   }
 
   function stopAR() {
     sessionRef.current?.end();
   }
+
+  function onPointerDown(e: React.PointerEvent) {
+    if (!isRunning) return;
+
+    // ✅ UI non deve triggerare il draw
+    if ((e.target as HTMLElement).closest("button,select,input,textarea,label,a")) return;
+
+    e.preventDefault();
+
+    activePointerIdRef.current = e.pointerId;
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {}
+
+    pointerRef.current = { x: e.clientX, y: e.clientY, active: true };
+
+    const three = threeRef.current!;
+    drawRef.current = { drawing: true, pointsWorld: [] };
+    previewThrottleRef.current = 0;
+    lastSurfaceHitRef.current = null;
+
+    // reset evidenziatore
+    stroke2DRef.current = [];
+    setStroke2D([]);
+
+    // fallback plane davanti camera
+    const renderer = rendererRef.current!;
+    const cam = getXRRenderCamera(renderer, three.camera);
+
+    const camPos = new THREE.Vector3();
+    cam.getWorldPosition(camPos);
+
+    const camQ = new THREE.Quaternion();
+    cam.getWorldQuaternion(camQ);
+
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ).normalize();
+    const pointOnPlane = camPos.clone().add(forward.clone().multiplyScalar(drawDistanceRef.current));
+    drawPlaneRef.current = { point: pointOnPlane, normal: forward };
+
+    // primo punto evidenziatore (2D)
+    pushStroke2D(e.clientX, e.clientY);
+
+    three.trail.reset();
+    three.preview.clear();
+    three.preview.visible = true;
+
+    setStatus("Evidenzio…");
+  }
+
+  function onPointerMove(e: React.PointerEvent) {
+    if (!isRunning) return;
+    if (activePointerIdRef.current !== e.pointerId) return;
+    if (!pointerRef.current.active) return;
+
+    e.preventDefault();
+
+    pointerRef.current.x = e.clientX;
+    pointerRef.current.y = e.clientY;
+
+    // evidenziatore 2D
+    pushStroke2D(e.clientX, e.clientY);
+  }
+
+  async function onPointerUp(e: React.PointerEvent) {
+    if (!isRunning) return;
+    if (activePointerIdRef.current !== e.pointerId) return;
+
+    e.preventDefault();
+
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {}
+
+    activePointerIdRef.current = null;
+    pointerRef.current.active = false;
+
+    const three = threeRef.current!;
+    const pts = drawRef.current.pointsWorld;
+    drawRef.current.drawing = false;
+
+    three.preview.visible = false;
+    three.preview.clear();
+
+    // pulisci evidenziatore (lasciamo un attimo? qui lo tolgo subito)
+    stroke2DRef.current = [];
+    setStroke2D([]);
+
+    if (pts.length < 10) {
+      setStatus("Tratto troppo corto.");
+      three.trail.reset();
+      return;
+    }
+
+    const rect0 = fitVerticalRectFromStroke(pts);
+    if (!rect0) {
+      setStatus("Non riesco a stimare un rettangolo. Riprova.");
+      three.trail.reset();
+      return;
+    }
+
+    const { rect, didSnap } = snapRectFrontToLastSurface(rect0);
+
+    const box = makeWindowBox(rect, {
+      thickness: thicknessRef.current,
+      color: COLORS[colorKey],
+    });
+
+    three.root.add(box);
+    placedRef.current.push(box);
+
+    // anchor se disponibile
+    const session = sessionRef.current;
+    const refSpace = refSpaceRef.current;
+    if (session && refSpace && anchorsSupportedRef.current) {
+      try {
+        const xrTransform = new XRRigidTransform(
+            { x: rect.center.x, y: rect.center.y, z: rect.center.z },
+            {
+              x: rect.quaternion.x,
+              y: rect.quaternion.y,
+              z: rect.quaternion.z,
+              w: rect.quaternion.w,
+            }
+        );
+        const anchor = await (session as unknown as {
+          requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor>;
+        }).requestAnchor(xrTransform, refSpace);
+
+        anchoredRef.current.push({ anchor, obj: box });
+      } catch {}
+    }
+
+    three.trail.reset();
+    drawPlaneRef.current = null;
+
+    setStatus(didSnap ? "Finestra frontale sul muro ✅" : "Creato (fallback plane)");
+  }
+
+  function onPointerCancel(e: React.PointerEvent) {
+    if (activePointerIdRef.current !== e.pointerId) return;
+
+    activePointerIdRef.current = null;
+    pointerRef.current.active = false;
+    drawRef.current.drawing = false;
+
+    const three = threeRef.current;
+    if (three) {
+      three.preview.visible = false;
+      three.preview.clear();
+      three.trail.reset();
+    }
+
+    drawPlaneRef.current = null;
+    lastSurfaceHitRef.current = null;
+
+    stroke2DRef.current = [];
+    setStroke2D([]);
+
+    setStatus("Annullato (pointercancel)");
+  }
+
+  function updatePreview(points: THREE.Vector3[]) {
+    const three = threeRef.current;
+    if (!three) return;
+
+    const rect = fitVerticalRectFromStroke(points);
+    if (!rect) return;
+
+    const { rect: snapped } = snapRectFrontToLastSurface(rect);
+    three.preview.clear();
+    three.preview.add(makePreviewRect(snapped, { color: COLORS[colorKey] }));
+    three.preview.visible = true;
+  }
+
+  // 1) punto preciso da hit-test transient touchscreen (superficie reale)
+  function pointFromTouchHitTest(frame: XRFrame): THREE.Vector3 | null {
+    const refSpace = refSpaceRef.current;
+    const src = transientHitTestSourceRef.current;
+    if (!refSpace || !src) return null;
+
+    const getTransient = (frame as unknown as {
+      getHitTestResultsForTransientInput?: (s: XRHitTestSource) => Array<{
+        inputSource: XRInputSource;
+        results: XRHitTestResult[];
+      }>;
+    }).getHitTestResultsForTransientInput;
+
+    if (!getTransient) return null;
+
+    const transientResults = getTransient.call(frame, src);
+    if (!transientResults || transientResults.length === 0) return null;
+
+    for (const tr of transientResults) {
+      const results = tr.results;
+      if (!results || results.length === 0) continue;
+
+      const pose = results[0].getPose(refSpace);
+      if (!pose) continue;
+
+      const t = pose.transform;
+      const pos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
+      const q = new THREE.Quaternion(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+
+      lastSurfaceHitRef.current = { position: pos.clone(), orientation: q.clone() };
+      return pos;
+    }
+
+    return null;
+  }
+
+  // 2) fallback: ray da pixel dito ∩ piano davanti camera
+  function pointFromScreenOnDrawPlane(): THREE.Vector3 | null {
+    const plane = drawPlaneRef.current;
+    const renderer = rendererRef.current;
+    const three = threeRef.current;
+    const container = containerRef.current;
+    if (!plane || !renderer || !three || !container) return null;
+    if (!pointerRef.current.active) return null;
+
+    const rect = container.getBoundingClientRect();
+    const x = ((pointerRef.current.x - rect.left) / rect.width) * 2 - 1;
+    const y = -(((pointerRef.current.y - rect.top) / rect.height) * 2 - 1);
+
+    const cam = getXRRenderCamera(renderer, three.camera);
+
+    const raycaster = raycasterRef.current;
+    raycaster.setFromCamera(new THREE.Vector2(x, y), cam);
+
+    return intersectRayPlane(raycaster.ray.origin, raycaster.ray.direction, plane.point, plane.normal);
+  }
+
+  // Snap frontale usando ultima superficie hittata
+  function snapRectFrontToLastSurface(rect: {
+    center: THREE.Vector3;
+    width: number;
+    height: number;
+    quaternion: THREE.Quaternion;
+    corners: THREE.Vector3[];
+  }): { rect: typeof rect; didSnap: boolean } {
+    const hit = lastSurfaceHitRef.current;
+    const renderer = rendererRef.current;
+    const three = threeRef.current;
+    if (!hit || !renderer || !three) return { rect, didSnap: false };
+
+    const hitPos = hit.position.clone();
+    const hitQ = hit.orientation.clone();
+
+    let forward = new THREE.Vector3(0, 0, -1).applyQuaternion(hitQ).normalize();
+
+    // yaw-only
+    forward.y = 0;
+    if (forward.lengthSq() < 1e-8) {
+      const cam = getXRRenderCamera(renderer, three.camera);
+      const camQ = new THREE.Quaternion();
+      cam.getWorldQuaternion(camQ);
+      forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ);
+      forward.y = 0;
+    }
+    forward.normalize();
+
+    // faccia verso camera
+    const cam = getXRRenderCamera(renderer, three.camera);
+    const camPos = new THREE.Vector3();
+    cam.getWorldPosition(camPos);
+
+    const toCam = camPos.clone().sub(hitPos).normalize();
+    if (forward.dot(toCam) < 0) forward.multiplyScalar(-1);
+
+    const up = new THREE.Vector3(0, 1, 0);
+    let right = new THREE.Vector3().crossVectors(up, forward);
+    if (right.lengthSq() < 1e-8) right = new THREE.Vector3(1, 0, 0);
+    right.normalize();
+
+    const basis = new THREE.Matrix4().makeBasis(right, up, forward);
+    const snappedQ = new THREE.Quaternion().setFromRotationMatrix(basis);
+
+    return { rect: { ...rect, center: hitPos, quaternion: snappedQ }, didSnap: true };
+  }
+
+  function pushStroke2D(clientX: number, clientY: number) {
+    const el = containerRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const p = { x: clientX - r.left, y: clientY - r.top };
+
+    const arr = stroke2DRef.current;
+    const last = arr[arr.length - 1];
+    if (!last || (Math.abs(last.x - p.x) + Math.abs(last.y - p.y)) > 2) {
+      arr.push(p);
+
+      const now = performance.now();
+      if (now - strokeThrottleRef.current > 30) {
+        strokeThrottleRef.current = now;
+        setStroke2D([...arr]);
+      }
+    }
+  }
+
+  const strokePath = useMemo(() => {
+    if (stroke2D.length === 0) return "";
+    return "M " + stroke2D.map((p) => `${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" L ");
+  }, [stroke2D]);
 
   function undoLast() {
     const three = threeRef.current;
@@ -257,6 +604,7 @@ export default function ARScene() {
 
     three.root.remove(last);
     disposeObject(last);
+
     setStatus("Ultimo rimosso.");
   }
 
@@ -279,234 +627,17 @@ export default function ARScene() {
     }
     placedRef.current = [];
 
+    three.preview.clear();
+    three.preview.visible = false;
+    three.trail.reset();
+    drawPlaneRef.current = null;
+    lastSurfaceHitRef.current = null;
+
+    stroke2DRef.current = [];
+    setStroke2D([]);
+
     setStatus("Tutto cancellato.");
   }
-
-  // ===== INPUT: evidenziatore =====
-
-  function onPointerDown(e: React.PointerEvent) {
-    if (!isRunning) return;
-
-    // non iniziare se tocchi UI
-    if ((e.target as HTMLElement).closest("button,select,input,textarea,label,a")) return;
-
-    e.preventDefault();
-
-    activePointerIdRef.current = e.pointerId;
-    try {
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    } catch {}
-
-    pointerRef.current = { x: e.clientX, y: e.clientY, active: true };
-
-    // prepara piano davanti camera (una volta per stroke)
-    setupFrontPlane();
-
-    // inizia stroke 2D
-    drawingRef.current = true;
-    const p = toLocalPoint(e.clientX, e.clientY);
-    strokePtsRef.current = [p];
-    setStrokePts([p]);
-
-    setStatus("Evidenzia… poi rilascia per creare il box.");
-  }
-
-  function onPointerMove(e: React.PointerEvent) {
-    if (!isRunning) return;
-    if (activePointerIdRef.current !== e.pointerId) return;
-    if (!pointerRef.current.active || !drawingRef.current) return;
-
-    e.preventDefault();
-    pointerRef.current.x = e.clientX;
-    pointerRef.current.y = e.clientY;
-
-    const p = toLocalPoint(e.clientX, e.clientY);
-    // decima un po’ (evita 2000 punti)
-    const arr = strokePtsRef.current;
-    const last = arr[arr.length - 1];
-    if (!last || dist2(last, p) > 2.5) {
-      arr.push(p);
-      // aggiorna UI (non ad ogni singolo pixel, ma abbastanza spesso)
-      if (arr.length % 2 === 0) setStrokePts([...arr]);
-    }
-  }
-
-  async function onPointerUp(e: React.PointerEvent) {
-    if (!isRunning) return;
-    if (activePointerIdRef.current !== e.pointerId) return;
-
-    e.preventDefault();
-
-    try {
-      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    } catch {}
-
-    activePointerIdRef.current = null;
-    pointerRef.current.active = false;
-    drawingRef.current = false;
-
-    const pts = strokePtsRef.current;
-    if (pts.length < 6) {
-      setStatus("Evidenziazione troppo corta.");
-      strokePtsRef.current = [];
-      setStrokePts([]);
-      return;
-    }
-
-    // bounding box 2D dell’area evidenziata
-    const bb = bounds2D(pts);
-
-    // proietta i 4 angoli del bounding box sul piano 3D
-    const rect3D = rectFromScreenBoundsOnPlane(bb);
-    if (!rect3D) {
-      setStatus("Non riesco a proiettare sul piano. Riprova.");
-      strokePtsRef.current = [];
-      setStrokePts([]);
-      return;
-    }
-
-    // crea box
-    const three = threeRef.current!;
-    const box = makeWindowBox(rect3D, { thickness: thicknessRef.current, color: COLORS[colorKey] });
-    three.root.add(box);
-    placedRef.current.push(box);
-
-    // anchor opzionale
-    const session = sessionRef.current;
-    const refSpace = refSpaceRef.current;
-    if (session && refSpace && anchorsSupportedRef.current) {
-      try {
-        const xrTransform = new XRRigidTransform(
-            { x: rect3D.center.x, y: rect3D.center.y, z: rect3D.center.z },
-            { x: rect3D.quaternion.x, y: rect3D.quaternion.y, z: rect3D.quaternion.z, w: rect3D.quaternion.w }
-        );
-        const anchor = await (session as unknown as {
-          requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor>;
-        }).requestAnchor(xrTransform, refSpace);
-        anchoredRef.current.push({ anchor, obj: box });
-      } catch {}
-    }
-
-    // pulisci stroke
-    strokePtsRef.current = [];
-    setStrokePts([]);
-
-    setStatus("Creato ✅");
-  }
-
-  function onPointerCancel(e: React.PointerEvent) {
-    if (activePointerIdRef.current !== e.pointerId) return;
-
-    activePointerIdRef.current = null;
-    pointerRef.current.active = false;
-    drawingRef.current = false;
-
-    strokePtsRef.current = [];
-    setStrokePts([]);
-
-    setStatus("Annullato (pointercancel)");
-  }
-
-  // ===== helper geometria =====
-
-  function toLocalPoint(clientX: number, clientY: number) {
-    const el = containerRef.current!;
-    const r = el.getBoundingClientRect();
-    return { x: clientX - r.left, y: clientY - r.top };
-  }
-
-  function setupFrontPlane() {
-    const renderer = rendererRef.current!;
-    const cam = getXRRenderCamera(renderer);
-
-    const camPos = new THREE.Vector3();
-    cam.getWorldPosition(camPos);
-
-    const camQ = new THREE.Quaternion();
-    cam.getWorldQuaternion(camQ);
-
-    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ).normalize();
-
-    // yaw-only (verticale)
-    const forwardYaw = forward.clone();
-    forwardYaw.y = 0;
-    if (forwardYaw.lengthSq() < 1e-8) forwardYaw.set(0, 0, -1);
-    forwardYaw.normalize();
-
-    const dist = clamp(autoDistRef.current ?? drawDistanceRef.current, 0.35, 4.0);
-    const pointOnPlane = camPos.clone().add(forwardYaw.clone().multiplyScalar(dist));
-    drawPlaneRef.current = { point: pointOnPlane, normal: forwardYaw };
-
-    const up = new THREE.Vector3(0, 1, 0);
-    let right = new THREE.Vector3().crossVectors(up, forwardYaw);
-    if (right.lengthSq() < 1e-8) right = new THREE.Vector3(1, 0, 0);
-    right.normalize();
-
-    planeAxesRef.current = { right, up, forward: forwardYaw };
-  }
-
-  function rectFromScreenBoundsOnPlane(bb: { minX: number; minY: number; maxX: number; maxY: number }) {
-    const plane = drawPlaneRef.current;
-    const axes = planeAxesRef.current;
-    const renderer = rendererRef.current;
-    const el = containerRef.current;
-    if (!plane || !axes || !renderer || !el) return null;
-
-    // 4 angoli del box 2D (in pixel, relativi al container)
-    const corners2D = [
-      { x: bb.minX, y: bb.minY },
-      { x: bb.maxX, y: bb.minY },
-      { x: bb.maxX, y: bb.maxY },
-      { x: bb.minX, y: bb.maxY },
-    ];
-
-    // proietta ogni corner sul piano 3D
-    const corners3D: THREE.Vector3[] = [];
-    for (const p of corners2D) {
-      const w = pointFromLocalPixelOnPlane(p.x, p.y);
-      if (!w) return null;
-      corners3D.push(w);
-    }
-
-    // width/height dal piano (dist tra corner)
-    const width = corners3D[0].distanceTo(corners3D[1]);
-    const height = corners3D[0].distanceTo(corners3D[3]);
-
-    // center = media dei 4 corners
-    const center = new THREE.Vector3();
-    for (const c of corners3D) center.add(c);
-    center.multiplyScalar(1 / 4);
-
-    // orientazione dal piano (right/up/forward)
-    const basis = new THREE.Matrix4().makeBasis(axes.right, axes.up, axes.forward);
-    const quaternion = new THREE.Quaternion().setFromRotationMatrix(basis);
-
-    return { center, width, height, quaternion };
-  }
-
-  function pointFromLocalPixelOnPlane(localX: number, localY: number): THREE.Vector3 | null {
-    const plane = drawPlaneRef.current;
-    const renderer = rendererRef.current;
-    const el = containerRef.current;
-    if (!plane || !renderer || !el) return null;
-
-    const r = el.getBoundingClientRect();
-    const ndcX = (localX / r.width) * 2 - 1;
-    const ndcY = -((localY / r.height) * 2 - 1);
-
-    const cam = getXRRenderCamera(renderer);
-    cam.updateMatrixWorld(true);
-
-    const raycaster = raycasterRef.current;
-    raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), cam);
-
-    return intersectRayPlane(raycaster.ray.origin, raycaster.ray.direction, plane.point, plane.normal);
-  }
-
-  const strokePath = useMemo(() => {
-    if (strokePts.length === 0) return "";
-    return "M " + strokePts.map((p) => `${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" L ");
-  }, [strokePts]);
 
   return (
       <div
@@ -518,29 +649,24 @@ export default function ARScene() {
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerCancel}
       >
-        {/* evidenziatore: SOLO VISIVO, non blocca input */}
-        <svg
-            className="absolute inset-0"
-            style={{ pointerEvents: "none" }}
-            width="100%"
-            height="100%"
-        >
+        {/* evidenziatore giallo (solo visuale, non blocca input) */}
+        <svg className="absolute inset-0" style={{ pointerEvents: "none" }} width="100%" height="100%">
           <path
               d={strokePath}
               fill="none"
-              stroke="rgba(255, 235, 59, 0.55)"  // giallo evidenziatore
+              stroke="rgba(255, 235, 59, 0.55)"
               strokeWidth={26}
               strokeLinecap="round"
               strokeLinejoin="round"
           />
         </svg>
 
-        {/* UI */}
         <div className="pointer-events-none absolute left-3 top-3 z-10 max-w-[560px]">
           <div className="pointer-events-none mb-2 text-sm text-white [text-shadow:_0_1px_2px_rgba(0,0,0,0.85)]">
             {status}
           </div>
 
+          {/* IMPORTANTISSIMO: stopPropagation qui, così i bottoni non fanno partire il draw */}
           <div
               className="pointer-events-auto flex flex-wrap gap-2"
               onPointerDownCapture={(e) => e.stopPropagation()}
@@ -609,9 +735,9 @@ export default function ARScene() {
               <span className="text-xs opacity-80">Dist.</span>
               <input
                   type="range"
-                  min={0.35}
-                  max={4.0}
-                  step={0.05}
+                  min={0.6}
+                  max={3.5}
+                  step={0.1}
                   defaultValue={drawDistanceRef.current}
                   onChange={(e) => (drawDistanceRef.current = Number(e.target.value))}
               />
@@ -619,40 +745,17 @@ export default function ARScene() {
           </div>
 
           <div className="pointer-events-none mt-2 text-xs text-white/80">
-            Evidenzia in giallo e rilascia → crea il box. (Distanza auto se hit-test becca superfici)
+            Evidenzia in giallo e rilascia → crea il box. Se il touch hit-test becca il muro, viene frontale.
           </div>
         </div>
       </div>
   );
 }
 
-/* ---------------- helpers ---------------- */
+// ---------------- helpers ----------------
 
-function clamp(v: number, a: number, b: number) {
-  return Math.max(a, Math.min(b, v));
-}
-
-function dist2(a: { x: number; y: number }, b: { x: number; y: number }) {
-  const dx = a.x - b.x;
-  const dy = a.y - b.y;
-  return Math.sqrt(dx * dx + dy * dy);
-}
-
-function bounds2D(pts: Array<{ x: number; y: number }>) {
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of pts) {
-    minX = Math.min(minX, p.x);
-    minY = Math.min(minY, p.y);
-    maxX = Math.max(maxX, p.x);
-    maxY = Math.max(maxY, p.y);
-  }
-  return { minX, minY, maxX, maxY };
-}
-
-function getXRRenderCamera(renderer: THREE.WebGLRenderer): THREE.Camera {
-  const xrCam = (renderer.xr as unknown as {
-    getCamera: () => THREE.Camera & { cameras?: THREE.Camera[] };
-  }).getCamera();
+function getXRRenderCamera(renderer: THREE.WebGLRenderer, baseCamera: THREE.Camera): THREE.Camera {
+  const xrCam = renderer.xr.getCamera(baseCamera) as unknown as THREE.Camera & { cameras?: THREE.Camera[] };
   return xrCam.cameras && xrCam.cameras.length > 0 ? xrCam.cameras[0] : xrCam;
 }
 
@@ -667,6 +770,39 @@ function intersectRayPlane(
   const t = planePoint.clone().sub(rayOrigin).dot(planeNormal) / denom;
   if (t < 0) return null;
   return rayOrigin.clone().add(rayDir.clone().multiplyScalar(t));
+}
+
+function makePreviewRect(rect: { corners: THREE.Vector3[] }, opts: { color: number }): THREE.Group {
+  const g = new THREE.Group();
+  const corners = rect.corners;
+
+  const fillGeom = new THREE.BufferGeometry();
+  const v = new Float32Array([
+    corners[0].x, corners[0].y, corners[0].z,
+    corners[1].x, corners[1].y, corners[1].z,
+    corners[2].x, corners[2].y, corners[2].z,
+    corners[2].x, corners[2].y, corners[2].z,
+    corners[3].x, corners[3].y, corners[3].z,
+    corners[0].x, corners[0].y, corners[0].z,
+  ]);
+  fillGeom.setAttribute("position", new THREE.BufferAttribute(v, 3));
+  fillGeom.computeVertexNormals();
+
+  const fillMat = new THREE.MeshStandardMaterial({
+    color: opts.color,
+    transparent: true,
+    opacity: 0.12,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+
+  g.add(new THREE.Mesh(fillGeom, fillMat));
+
+  const lineGeom = new THREE.BufferGeometry().setFromPoints([...corners, corners[0]]);
+  const lineMat = new THREE.LineBasicMaterial({ color: opts.color, transparent: true, opacity: 0.95 });
+  g.add(new THREE.Line(lineGeom, lineMat));
+
+  return g;
 }
 
 function makeWindowBox(
