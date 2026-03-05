@@ -5,6 +5,7 @@ import * as THREE from "three";
 import { makeGoldenTrail } from "@/server-utils/lib/fx/goldenTrail";
 
 type Anchored = { anchor: XRAnchor; obj: THREE.Object3D };
+type Plane = { point: THREE.Vector3; normal: THREE.Vector3 };
 
 type ColorKey = "gold" | "cyan" | "magenta" | "white";
 const COLORS: Record<ColorKey, number> = {
@@ -13,8 +14,6 @@ const COLORS: Record<ColorKey, number> = {
   magenta: 0xff4fd8,
   white: 0xffffff,
 };
-
-type Plane = { point: THREE.Vector3; normal: THREE.Vector3 };
 
 function isMaterialWithColor(
     m: unknown
@@ -29,6 +28,7 @@ function isMaterialWithColor(
 
 export default function ARScene() {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const drawLayerRef = useRef<HTMLDivElement | null>(null);
 
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const threeRef = useRef<{
@@ -45,38 +45,36 @@ export default function ARScene() {
   const sessionRef = useRef<XRSession | null>(null);
   const refSpaceRef = useRef<XRReferenceSpace | null>(null);
 
+  // viewer hit-test → distanza “stimata”
   const viewerHitTestSourceRef = useRef<XRHitTestSource | null>(null);
   const autoDistRef = useRef<number | null>(null);
 
+  // Anchors
   const anchorsSupportedRef = useRef(false);
   const anchoredRef = useRef<Anchored[]>([]);
   const placedRef = useRef<THREE.Object3D[]>([]);
 
   const [colorKey, setColorKey] = useState<ColorKey>("magenta");
   const thicknessRef = useRef(0.06);
-
   const drawDistanceRef = useRef(1.2);
+
+  // piano “muro finto”
   const drawPlaneRef = useRef<Plane | null>(null);
+  const planeAxesRef = useRef<{ right: THREE.Vector3; up: THREE.Vector3; forward: THREE.Vector3 } | null>(null);
 
-  const planeAxesRef = useRef<{
-    right: THREE.Vector3;
-    up: THREE.Vector3;
-    forward: THREE.Vector3;
-  } | null>(null);
+  // drag rect
+  const dragRef = useRef<{ dragging: boolean; a: THREE.Vector3 | null; b: THREE.Vector3 | null }>({
+    dragging: false,
+    a: null,
+    b: null,
+  });
 
-  const dragRef = useRef<{
-    dragging: boolean;
-    a: THREE.Vector3 | null;
-    b: THREE.Vector3 | null;
-  }>({ dragging: false, a: null, b: null });
-
+  // pointer
   const pointerRef = useRef<{ x: number; y: number; active: boolean }>({
     x: 0,
     y: 0,
     active: false,
   });
-
-  // ✅ per drag affidabile
   const activePointerIdRef = useRef<number | null>(null);
 
   const raycasterRef = useRef(new THREE.Raycaster());
@@ -94,14 +92,14 @@ export default function ARScene() {
     renderer.setClearColor(0x000000, 0);
     renderer.setClearAlpha(0);
 
-    // canvas overlay semplice (NON tocchiamo pointerEvents)
+    // Canvas: fullscreen, ma NON prende input
     renderer.domElement.style.position = "absolute";
     renderer.domElement.style.inset = "0";
     renderer.domElement.style.width = "100%";
     renderer.domElement.style.height = "100%";
     renderer.domElement.style.display = "block";
+    renderer.domElement.style.pointerEvents = "none"; // ✅ così non rompe UI
 
-    container.style.position = "relative";
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -131,8 +129,7 @@ export default function ARScene() {
       const rect = container.getBoundingClientRect();
       const w = Math.max(1, Math.floor(rect.width));
       const h = Math.max(1, Math.floor(rect.height));
-      // come versione “vecchia” che ti funzionava
-      renderer.setSize(w, h, false);
+      renderer.setSize(w, h, true);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     });
     ro.observe(container);
@@ -177,8 +174,7 @@ export default function ARScene() {
 
     sessionRef.current = session;
     anchorsSupportedRef.current =
-        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor ===
-        "function";
+        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor === "function";
 
     const renderer = rendererRef.current!;
     await renderer.xr.setSession(session);
@@ -223,13 +219,14 @@ export default function ARScene() {
     });
 
     setIsRunning(true);
-    setStatus("AR avviata. Trascina per creare un rettangolo dal dito.");
+    setStatus("AR avviata. Trascina sullo schermo per creare un rettangolo.");
 
     renderer.setAnimationLoop((_time, frame) => {
       const three = threeRef.current!;
       const refSpaceNow = refSpaceRef.current!;
       const rendererNow = rendererRef.current!;
 
+      // distanza “auto” dal viewer hit-test
       if (frame && viewerHitTestSourceRef.current && refSpaceNow) {
         const hits = frame.getHitTestResults(viewerHitTestSourceRef.current);
         if (hits && hits.length > 0) {
@@ -251,10 +248,12 @@ export default function ARScene() {
         }
       }
 
+      // aggiorna preview durante drag
       if (frame && dragRef.current.dragging && pointerRef.current.active) {
         const b = pointFromScreenOnDrawPlane();
         if (b) {
           dragRef.current.b = b;
+
           const now = performance.now();
           if (now - previewThrottleRef.current > 30) {
             previewThrottleRef.current = now;
@@ -263,6 +262,7 @@ export default function ARScene() {
         }
       }
 
+      // aggiorna anchor
       if (frame && refSpaceNow) {
         for (const item of anchoredRef.current) {
           const pose = frame.getPose(item.anchor.anchorSpace, refSpaceNow);
@@ -281,11 +281,10 @@ export default function ARScene() {
     sessionRef.current?.end();
   }
 
-  function onPointerDown(e: React.PointerEvent) {
-    if (!isRunning) return;
+  // ===== DRAW LAYER HANDLERS (non UI, non canvas) =====
 
-    // non iniziare se tocchi UI
-    if ((e.target as HTMLElement).closest("button,select,input,textarea,label,a")) return;
+  function onDrawPointerDown(e: React.PointerEvent) {
+    if (!isRunning) return;
 
     e.preventDefault();
 
@@ -334,10 +333,10 @@ export default function ARScene() {
     three.preview.visible = true;
 
     if (a) three.trail.pushPoint(a);
-    setStatus(`Drag… (piano ~${dist.toFixed(2)}m, auto:${autoDistRef.current ? "si" : "no"})`);
+    setStatus(`Drag… (piano ~${dist.toFixed(2)}m)`);
   }
 
-  function onPointerMove(e: React.PointerEvent) {
+  function onDrawPointerMove(e: React.PointerEvent) {
     if (!isRunning) return;
     if (activePointerIdRef.current !== e.pointerId) return;
     if (!pointerRef.current.active) return;
@@ -347,7 +346,7 @@ export default function ARScene() {
     pointerRef.current.y = e.clientY;
   }
 
-  async function onPointerUp(e: React.PointerEvent) {
+  async function onDrawPointerUp(e: React.PointerEvent) {
     if (!isRunning) return;
     if (activePointerIdRef.current !== e.pointerId) return;
 
@@ -393,6 +392,7 @@ export default function ARScene() {
     three.root.add(box);
     placedRef.current.push(box);
 
+    // anchor opzionale
     const session = sessionRef.current;
     const refSpace = refSpaceRef.current;
     if (session && refSpace && anchorsSupportedRef.current) {
@@ -413,10 +413,10 @@ export default function ARScene() {
     drawPlaneRef.current = null;
     planeAxesRef.current = null;
 
-    setStatus("Creato ✅ (rettangolo parte dal dito)");
+    setStatus("Creato ✅");
   }
 
-  function onPointerCancel(e: React.PointerEvent) {
+  function onDrawPointerCancel(e: React.PointerEvent) {
     if (activePointerIdRef.current !== e.pointerId) return;
 
     activePointerIdRef.current = null;
@@ -433,8 +433,10 @@ export default function ARScene() {
     drawPlaneRef.current = null;
     planeAxesRef.current = null;
 
-    setStatus("Drag annullato (pointercancel)");
+    setStatus("Drag annullato (cancel)");
   }
+
+  // ===== core math =====
 
   function updatePreviewFromDrag() {
     const three = threeRef.current;
@@ -457,12 +459,12 @@ export default function ARScene() {
   function pointFromScreenOnDrawPlane(): THREE.Vector3 | null {
     const plane = drawPlaneRef.current;
     const renderer = rendererRef.current;
-    const container = containerRef.current;
-    if (!plane || !renderer || !container) return null;
+    const drawLayer = drawLayerRef.current;
+    if (!plane || !renderer || !drawLayer) return null;
     if (!pointerRef.current.active) return null;
 
-    // come la versione “vecchia” che interagiva: usa rect del container
-    const rect = container.getBoundingClientRect();
+    // IMPORTANTE: mapping rispetto al draw layer (che è davvero full screen)
+    const rect = drawLayer.getBoundingClientRect();
     const x = ((pointerRef.current.x - rect.left) / rect.width) * 2 - 1;
     const y = -(((pointerRef.current.y - rect.top) / rect.height) * 2 - 1);
 
@@ -530,15 +532,19 @@ export default function ARScene() {
   }
 
   return (
-      <div
-          ref={containerRef}
-          className="absolute inset-0"
-          style={{ touchAction: "none" }}
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={onPointerUp}
-          onPointerCancel={onPointerCancel}
-      >
+      <div ref={containerRef} className="absolute inset-0" style={{ touchAction: "none" }}>
+        {/* LAYER DI DISEGNO (sopra canvas, sotto UI) */}
+        <div
+            ref={drawLayerRef}
+            className="absolute inset-0"
+            style={{ zIndex: 5, touchAction: "none" }}
+            onPointerDown={onDrawPointerDown}
+            onPointerMove={onDrawPointerMove}
+            onPointerUp={onDrawPointerUp}
+            onPointerCancel={onDrawPointerCancel}
+        />
+
+        {/* UI (sempre sopra) */}
         <div className="pointer-events-none absolute left-3 top-3 z-10 max-w-[560px]">
           <div className="pointer-events-none mb-2 text-sm text-white [text-shadow:_0_1px_2px_rgba(0,0,0,0.85)]">
             {status}
@@ -546,6 +552,7 @@ export default function ARScene() {
 
           <div
               className="pointer-events-auto flex flex-wrap gap-2"
+              // blocca bubbling verso drawLayer
               onPointerDownCapture={(e) => e.stopPropagation()}
               onPointerMoveCapture={(e) => e.stopPropagation()}
               onPointerUpCapture={(e) => e.stopPropagation()}
@@ -679,7 +686,6 @@ function makePreviewRectFromPose(
     opts: { color: number }
 ): THREE.Group {
   const g = new THREE.Group();
-
   const hw = rect.width * 0.5;
   const hh = rect.height * 0.5;
 
