@@ -18,6 +18,8 @@ const COLORS: Record<ColorKey, number> = {
 
 type Plane = { point: THREE.Vector3; normal: THREE.Vector3 };
 
+type Phase = "idle" | "drawing" | "processing";
+
 // ---------------- type guards ----------------
 function isMaterialWithColor(
     m: unknown
@@ -45,6 +47,7 @@ export default function ARScene() {
 
   const [status, setStatus] = useState("Pronto");
   const [isRunning, setIsRunning] = useState(false);
+  const [phase, setPhase] = useState<Phase>("idle");
 
   const sessionRef = useRef<XRSession | null>(null);
   const refSpaceRef = useRef<XRReferenceSpace | null>(null);
@@ -85,12 +88,20 @@ export default function ARScene() {
     orientation: THREE.Quaternion;
   } | null>(null);
 
+  // ✅ salvo il primo hit valido del tratto (più stabile per lo snap)
+  const firstSurfaceHitRef = useRef<{
+    position: THREE.Vector3;
+    orientation: THREE.Quaternion;
+  } | null>(null);
+
   // per update in loop
   const lastFrameRef = useRef<XRFrame | null>(null);
 
   // --- evidenziatore 2D (solo visuale) ---
   const stroke2DRef = useRef<Array<{ x: number; y: number }>>([]);
-  const [stroke2D, setStroke2D] = useState<Array<{ x: number; y: number }>>([]);
+  const [stroke2D, setStroke2D] = useState<Array<{ x: number; y: number }>>(
+      []
+  );
   const strokeThrottleRef = useRef(0);
 
   useEffect(() => {
@@ -104,6 +115,13 @@ export default function ARScene() {
     renderer.xr.enabled = true;
     renderer.setClearColor(0x000000, 0);
     renderer.setClearAlpha(0);
+
+    // ✅ IMPORTANTISSIMO: la canvas deve stare "sotto" SVG/UI
+    renderer.domElement.style.position = "absolute";
+    renderer.domElement.style.inset = "0";
+    renderer.domElement.style.width = "100%";
+    renderer.domElement.style.height = "100%";
+    renderer.domElement.style.zIndex = "0";
 
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
@@ -135,7 +153,6 @@ export default function ARScene() {
       const w = Math.max(1, Math.floor(rect.width));
       const h = Math.max(1, Math.floor(rect.height));
 
-      // ✅ COME LA VERSIONE CHE “FUNZIONAVA”
       renderer.setSize(w, h, false);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     });
@@ -200,7 +217,9 @@ export default function ARScene() {
             requestHitTestSourceForTransientInput?: (o: {
               profile: string;
             }) => Promise<XRHitTestSource>;
-          }).requestHitTestSourceForTransientInput?.({ profile: "generic-touchscreen" })) ?? null;
+          }).requestHitTestSourceForTransientInput?.({
+            profile: "generic-touchscreen",
+          })) ?? null;
     } catch {
       transientHitTestSourceRef.current = null;
     }
@@ -209,6 +228,7 @@ export default function ARScene() {
       transientHitTestSourceRef.current = null;
       lastFrameRef.current = null;
       lastSurfaceHitRef.current = null;
+      firstSurfaceHitRef.current = null;
 
       refSpaceRef.current = null;
       sessionRef.current = null;
@@ -232,10 +252,12 @@ export default function ARScene() {
       setStroke2D([]);
 
       setIsRunning(false);
+      setPhase("idle");
       setStatus("Sessione AR terminata");
     });
 
     setIsRunning(true);
+    setPhase("idle");
     setStatus("AR avviata. Evidenzia col dito (giallo) e rilascia.");
 
     renderer.setAnimationLoop((_time, frame) => {
@@ -283,9 +305,11 @@ export default function ARScene() {
 
   function onPointerDown(e: React.PointerEvent) {
     if (!isRunning) return;
+    if (phase === "processing") return;
 
     // ✅ UI non deve triggerare il draw
-    if ((e.target as HTMLElement).closest("button,select,input,textarea,label,a")) return;
+    if ((e.target as HTMLElement).closest("button,select,input,textarea,label,a"))
+      return;
 
     e.preventDefault();
 
@@ -300,6 +324,9 @@ export default function ARScene() {
     drawRef.current = { drawing: true, pointsWorld: [] };
     previewThrottleRef.current = 0;
     lastSurfaceHitRef.current = null;
+    firstSurfaceHitRef.current = null;
+
+    setPhase("drawing");
 
     // reset evidenziatore
     stroke2DRef.current = [];
@@ -316,7 +343,9 @@ export default function ARScene() {
     cam.getWorldQuaternion(camQ);
 
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ).normalize();
-    const pointOnPlane = camPos.clone().add(forward.clone().multiplyScalar(drawDistanceRef.current));
+    const pointOnPlane = camPos
+        .clone()
+        .add(forward.clone().multiplyScalar(drawDistanceRef.current));
     drawPlaneRef.current = { point: pointOnPlane, normal: forward };
 
     // primo punto evidenziatore (2D)
@@ -333,6 +362,7 @@ export default function ARScene() {
     if (!isRunning) return;
     if (activePointerIdRef.current !== e.pointerId) return;
     if (!pointerRef.current.active) return;
+    if (phase !== "drawing") return;
 
     e.preventDefault();
 
@@ -357,26 +387,37 @@ export default function ARScene() {
     pointerRef.current.active = false;
 
     const three = threeRef.current!;
-    const pts = drawRef.current.pointsWorld;
+    const pts = [...drawRef.current.pointsWorld];
+
     drawRef.current.drawing = false;
 
     three.preview.visible = false;
     three.preview.clear();
 
-    // pulisci evidenziatore (lasciamo un attimo? qui lo tolgo subito)
-    stroke2DRef.current = [];
-    setStroke2D([]);
-
     if (pts.length < 10) {
       setStatus("Tratto troppo corto.");
       three.trail.reset();
+      setPhase("idle");
+      // pulisci overlay
+      stroke2DRef.current = [];
+      setStroke2D([]);
       return;
     }
+
+    // ✅ STEP: processing (lasciamo overlay giallo visibile un attimo)
+    setPhase("processing");
+    setStatus("Creo…");
+
+    // piccolo delay per rendere percepibile lo step
+    await new Promise((r) => setTimeout(r, 250));
 
     const rect0 = fitVerticalRectFromStroke(pts);
     if (!rect0) {
       setStatus("Non riesco a stimare un rettangolo. Riprova.");
       three.trail.reset();
+      setPhase("idle");
+      stroke2DRef.current = [];
+      setStroke2D([]);
       return;
     }
 
@@ -405,7 +446,10 @@ export default function ARScene() {
             }
         );
         const anchor = await (session as unknown as {
-          requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor>;
+          requestAnchor: (
+              t: XRRigidTransform,
+              s: XRReferenceSpace
+          ) => Promise<XRAnchor>;
         }).requestAnchor(xrTransform, refSpace);
 
         anchoredRef.current.push({ anchor, obj: box });
@@ -416,6 +460,11 @@ export default function ARScene() {
     drawPlaneRef.current = null;
 
     setStatus(didSnap ? "Finestra frontale sul muro ✅" : "Creato (fallback plane)");
+    setPhase("idle");
+
+    // pulizia overlay
+    stroke2DRef.current = [];
+    setStroke2D([]);
   }
 
   function onPointerCancel(e: React.PointerEvent) {
@@ -434,10 +483,12 @@ export default function ARScene() {
 
     drawPlaneRef.current = null;
     lastSurfaceHitRef.current = null;
+    firstSurfaceHitRef.current = null;
 
     stroke2DRef.current = [];
     setStroke2D([]);
 
+    setPhase("idle");
     setStatus("Annullato (pointercancel)");
   }
 
@@ -481,9 +532,20 @@ export default function ARScene() {
 
       const t = pose.transform;
       const pos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
-      const q = new THREE.Quaternion(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+      const q = new THREE.Quaternion(
+          t.orientation.x,
+          t.orientation.y,
+          t.orientation.z,
+          t.orientation.w
+      );
 
       lastSurfaceHitRef.current = { position: pos.clone(), orientation: q.clone() };
+      if (!firstSurfaceHitRef.current) {
+        firstSurfaceHitRef.current = {
+          position: pos.clone(),
+          orientation: q.clone(),
+        };
+      }
       return pos;
     }
 
@@ -508,10 +570,15 @@ export default function ARScene() {
     const raycaster = raycasterRef.current;
     raycaster.setFromCamera(new THREE.Vector2(x, y), cam);
 
-    return intersectRayPlane(raycaster.ray.origin, raycaster.ray.direction, plane.point, plane.normal);
+    return intersectRayPlane(
+        raycaster.ray.origin,
+        raycaster.ray.direction,
+        plane.point,
+        plane.normal
+    );
   }
 
-  // Snap frontale usando ultima superficie hittata
+  // ✅ Snap: orientamento dal muro, ma centro coerente col tratto (proiettato sul piano muro)
   function snapRectFrontToLastSurface(rect: {
     center: THREE.Vector3;
     width: number;
@@ -519,7 +586,9 @@ export default function ARScene() {
     quaternion: THREE.Quaternion;
     corners: THREE.Vector3[];
   }): { rect: typeof rect; didSnap: boolean } {
-    const hit = lastSurfaceHitRef.current;
+    const hit =
+        firstSurfaceHitRef.current ?? lastSurfaceHitRef.current;
+
     const renderer = rendererRef.current;
     const three = threeRef.current;
     if (!hit || !renderer || !three) return { rect, didSnap: false };
@@ -529,7 +598,7 @@ export default function ARScene() {
 
     let forward = new THREE.Vector3(0, 0, -1).applyQuaternion(hitQ).normalize();
 
-    // yaw-only
+    // yaw-only (stabile)
     forward.y = 0;
     if (forward.lengthSq() < 1e-8) {
       const cam = getXRRenderCamera(renderer, three.camera);
@@ -556,7 +625,18 @@ export default function ARScene() {
     const basis = new THREE.Matrix4().makeBasis(right, up, forward);
     const snappedQ = new THREE.Quaternion().setFromRotationMatrix(basis);
 
-    return { rect: { ...rect, center: hitPos, quaternion: snappedQ }, didSnap: true };
+    // ✅ proietta il centro stimato dal tratto sul piano del muro
+    const planePoint = hitPos;      // punto sul muro
+    const planeNormal = forward;    // normale muro (yaw-only)
+    const center = rect.center.clone();
+
+    const dist = center.clone().sub(planePoint).dot(planeNormal);
+    const projectedCenter = center.clone().sub(planeNormal.clone().multiplyScalar(dist));
+
+    return {
+      rect: { ...rect, center: projectedCenter, quaternion: snappedQ },
+      didSnap: true,
+    };
   }
 
   function pushStroke2D(clientX: number, clientY: number) {
@@ -567,7 +647,7 @@ export default function ARScene() {
 
     const arr = stroke2DRef.current;
     const last = arr[arr.length - 1];
-    if (!last || (Math.abs(last.x - p.x) + Math.abs(last.y - p.y)) > 2) {
+    if (!last || Math.abs(last.x - p.x) + Math.abs(last.y - p.y) > 2) {
       arr.push(p);
 
       const now = performance.now();
@@ -632,25 +712,32 @@ export default function ARScene() {
     three.trail.reset();
     drawPlaneRef.current = null;
     lastSurfaceHitRef.current = null;
+    firstSurfaceHitRef.current = null;
 
     stroke2DRef.current = [];
     setStroke2D([]);
 
+    setPhase("idle");
     setStatus("Tutto cancellato.");
   }
 
   return (
       <div
           ref={containerRef}
-          className="absolute inset-0"
+          className="absolute inset-0 relative" // ✅ relative per stacking
           style={{ touchAction: "none" }}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerCancel}
       >
-        {/* evidenziatore giallo (solo visuale, non blocca input) */}
-        <svg className="absolute inset-0" style={{ pointerEvents: "none" }} width="100%" height="100%">
+        {/* ✅ evidenziatore giallo (sopra canvas) */}
+        <svg
+            className="absolute inset-0"
+            style={{ pointerEvents: "none", zIndex: 10 }}
+            width="100%"
+            height="100%"
+        >
           <path
               d={strokePath}
               fill="none"
@@ -661,12 +748,15 @@ export default function ARScene() {
           />
         </svg>
 
-        <div className="pointer-events-none absolute left-3 top-3 z-10 max-w-[560px]">
+        <div className="pointer-events-none absolute left-3 top-3 z-20 max-w-[560px]">
           <div className="pointer-events-none mb-2 text-sm text-white [text-shadow:_0_1px_2px_rgba(0,0,0,0.85)]">
             {status}
+            {phase === "processing" && (
+                <span className="ml-2 text-yellow-200">• Elaborazione…</span>
+            )}
           </div>
 
-          {/* IMPORTANTISSIMO: stopPropagation qui, così i bottoni non fanno partire il draw */}
+          {/* stopPropagation così i bottoni non fanno partire il draw */}
           <div
               className="pointer-events-auto flex flex-wrap gap-2"
               onPointerDownCapture={(e) => e.stopPropagation()}
@@ -745,7 +835,8 @@ export default function ARScene() {
           </div>
 
           <div className="pointer-events-none mt-2 text-xs text-white/80">
-            Evidenzia in giallo e rilascia → crea il box. Se il touch hit-test becca il muro, viene frontale.
+            Evidenzia in giallo e rilascia → (processing) → crea il box. Se il touch hit-test becca il muro,
+            viene frontale e posizionato coerente col tratto.
           </div>
         </div>
       </div>
@@ -754,14 +845,15 @@ export default function ARScene() {
 
 // ---------------- helpers ----------------
 
-function getXRRenderCamera(renderer: THREE.WebGLRenderer, fallbackCamera: THREE.Camera): THREE.Camera {
-  // In alcune versioni di three, getCamera() non accetta argomenti.
-  const xrCam = (renderer.xr as unknown as { getCamera: () => THREE.Camera & { cameras?: THREE.Camera[] } }).getCamera();
+function getXRRenderCamera(
+    renderer: THREE.WebGLRenderer,
+    fallbackCamera: THREE.Camera
+): THREE.Camera {
+  const xrCam = (renderer.xr as unknown as {
+    getCamera: () => THREE.Camera & { cameras?: THREE.Camera[] };
+  }).getCamera();
 
-  // In AR spesso è ArrayCamera: prendi la prima camera “reale”
   const cam = xrCam.cameras && xrCam.cameras.length > 0 ? xrCam.cameras[0] : xrCam;
-
-  // Se per qualsiasi motivo non è pronto, usa la camera fallback
   return cam ?? fallbackCamera;
 }
 
