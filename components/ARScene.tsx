@@ -66,7 +66,11 @@ export default function ARScene() {
   const drawPlaneRef = useRef<Plane | null>(null);
 
   // assi del piano (right/up) bloccati al down
-  const planeAxesRef = useRef<{ right: THREE.Vector3; up: THREE.Vector3; forward: THREE.Vector3 } | null>(null);
+  const planeAxesRef = useRef<{
+    right: THREE.Vector3;
+    up: THREE.Vector3;
+    forward: THREE.Vector3;
+  } | null>(null);
 
   // rettangolo in drag: cornerA (down) + cornerB (current)
   const dragRef = useRef<{
@@ -126,7 +130,10 @@ export default function ARScene() {
       const rect = container.getBoundingClientRect();
       const w = Math.max(1, Math.floor(rect.width));
       const h = Math.max(1, Math.floor(rect.height));
-      renderer.setSize(w, h, false);
+
+      // ✅ FIX 1: aggiorna anche lo style del canvas (niente mismatch)
+      renderer.setSize(w, h, true);
+
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     });
     ro.observe(container);
@@ -171,7 +178,8 @@ export default function ARScene() {
 
     sessionRef.current = session;
     anchorsSupportedRef.current =
-        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor === "function";
+        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor ===
+        "function";
 
     const renderer = rendererRef.current!;
     await renderer.xr.setSession(session);
@@ -228,7 +236,11 @@ export default function ARScene() {
           const pose = hits[0].getPose(refSpaceNow);
           if (pose) {
             const t = pose.transform;
-            const hitPos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
+            const hitPos = new THREE.Vector3(
+                t.position.x,
+                t.position.y,
+                t.position.z
+            );
 
             const cam = getXRRenderCamera(rendererNow);
             const camPos = new THREE.Vector3();
@@ -239,7 +251,8 @@ export default function ARScene() {
 
             // smoothing: EMA
             const prev = autoDistRef.current;
-            autoDistRef.current = prev == null ? clamped : prev * 0.85 + clamped * 0.15;
+            autoDistRef.current =
+                prev == null ? clamped : prev * 0.85 + clamped * 0.15;
           }
         }
       }
@@ -265,7 +278,12 @@ export default function ARScene() {
           if (!pose) continue;
           const t = pose.transform;
           item.obj.position.set(t.position.x, t.position.y, t.position.z);
-          item.obj.quaternion.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+          item.obj.quaternion.set(
+              t.orientation.x,
+              t.orientation.y,
+              t.orientation.z,
+              t.orientation.w
+          );
         }
       }
 
@@ -293,7 +311,9 @@ export default function ARScene() {
     cam.getWorldQuaternion(camQ);
 
     // forward camera
-    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ).normalize();
+    const forward = new THREE.Vector3(0, 0, -1)
+        .applyQuaternion(camQ)
+        .normalize();
 
     // yaw-only forward (porta/finestra “verticale”)
     const forwardYaw = forward.clone();
@@ -305,7 +325,9 @@ export default function ARScene() {
     const dist = clamp(autoDistRef.current ?? drawDistanceRef.current, 0.35, 4.0);
 
     // piano “muro finto” davanti camera
-    const pointOnPlane = camPos.clone().add(forwardYaw.clone().multiplyScalar(dist));
+    const pointOnPlane = camPos
+        .clone()
+        .add(forwardYaw.clone().multiplyScalar(dist));
     drawPlaneRef.current = { point: pointOnPlane, normal: forwardYaw };
 
     // assi sul piano: right = up x forward, up = world up
@@ -326,7 +348,9 @@ export default function ARScene() {
     three.preview.visible = true;
 
     if (a) three.trail.pushPoint(a);
-    setStatus(`Drag… (piano ~${dist.toFixed(2)}m, auto:${autoDistRef.current ? "si" : "no"})`);
+    setStatus(
+        `Drag… (piano ~${dist.toFixed(2)}m, auto:${autoDistRef.current ? "si" : "no"})`
+    );
   }
 
   function onPointerMove(e: React.PointerEvent) {
@@ -381,7 +405,12 @@ export default function ARScene() {
       try {
         const xrTransform = new XRRigidTransform(
             { x: rect.center.x, y: rect.center.y, z: rect.center.z },
-            { x: rect.quaternion.x, y: rect.quaternion.y, z: rect.quaternion.z, w: rect.quaternion.w }
+            {
+              x: rect.quaternion.x,
+              y: rect.quaternion.y,
+              z: rect.quaternion.z,
+              w: rect.quaternion.w,
+            }
         );
         const anchor = await (session as unknown as {
           requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor>;
@@ -421,19 +450,29 @@ export default function ARScene() {
   function pointFromScreenOnDrawPlane(): THREE.Vector3 | null {
     const plane = drawPlaneRef.current;
     const renderer = rendererRef.current;
-    const container = containerRef.current;
-    if (!plane || !renderer || !container) return null;
+    if (!plane || !renderer) return null;
     if (!pointerRef.current.active) return null;
 
-    const rect = container.getBoundingClientRect();
+    // ✅ FIX 2: usa il rettangolo del CANVAS, non del container
+    const rect = renderer.domElement.getBoundingClientRect();
+
     const x = ((pointerRef.current.x - rect.left) / rect.width) * 2 - 1;
     const y = -(((pointerRef.current.y - rect.top) / rect.height) * 2 - 1);
 
     const cam = getXRRenderCamera(renderer);
+
+    // ✅ micro-fix: matrix world aggiornata prima del ray
+    cam.updateMatrixWorld(true);
+
     const raycaster = raycasterRef.current;
     raycaster.setFromCamera(new THREE.Vector2(x, y), cam);
 
-    return intersectRayPlane(raycaster.ray.origin, raycaster.ray.direction, plane.point, plane.normal);
+    return intersectRayPlane(
+        raycaster.ray.origin,
+        raycaster.ray.direction,
+        plane.point,
+        plane.normal
+    );
   }
 
   function undoLast() {
@@ -619,19 +658,17 @@ function rectFromTwoPointsOnPlane(
 ): { center: THREE.Vector3; width: number; height: number; quaternion: THREE.Quaternion } {
   const d = b.clone().sub(a);
 
-  const dx = d.dot(axes.right); // componente lungo right
-  const dy = d.dot(axes.up);    // componente lungo up (world Y)
+  const dx = d.dot(axes.right);
+  const dy = d.dot(axes.up);
 
   const width = Math.abs(dx);
   const height = Math.abs(dy);
 
-  // cornerA è a; per avere sempre center corretto, spostiamo dal cornerA verso dx/dy metà
   const center = a
       .clone()
       .add(axes.right.clone().multiplyScalar(dx * 0.5))
       .add(axes.up.clone().multiplyScalar(dy * 0.5));
 
-  // orientazione del piano
   const basis = new THREE.Matrix4().makeBasis(axes.right, axes.up, axes.forward);
   const quaternion = new THREE.Quaternion().setFromRotationMatrix(basis);
 
