@@ -20,9 +20,9 @@ export function fitRectOnBestPlane(points: THREE.Vector3[]) {
   const u = dir1.clone().normalize();
   // orthogonalize dir2 vs u
   const v = dir2
-    .clone()
-    .sub(u.clone().multiplyScalar(dir2.dot(u)))
-    .normalize();
+      .clone()
+      .sub(u.clone().multiplyScalar(dir2.dot(u)))
+      .normalize();
 
   if (v.lengthSq() < 1e-10) return null;
 
@@ -30,7 +30,10 @@ export function fitRectOnBestPlane(points: THREE.Vector3[]) {
   if (n.lengthSq() < 1e-10) return null;
 
   // project points into (u,v)
-  let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+  let minU = Infinity,
+      maxU = -Infinity,
+      minV = Infinity,
+      maxV = -Infinity;
 
   for (const p of points) {
     const d = p.clone().sub(c);
@@ -59,6 +62,98 @@ export function fitRectOnBestPlane(points: THREE.Vector3[]) {
     normal: n,
     u,
     v,
+  };
+}
+
+/**
+ * ✅ Fit rettangolo "verticale" (dritto), pensato per finestre/aperture:
+ * - up = (0,1,0)
+ * - right stimato dal tratto (farthest pair sul piano XZ)
+ * - forward = up x right
+ * - bbox su (right, up) => rettangolo
+ */
+export function fitVerticalRectFromStroke(points: THREE.Vector3[]) {
+  if (points.length < 8) return null;
+
+  // centroid
+  const c = new THREE.Vector3();
+  for (const p of points) c.add(p);
+  c.multiplyScalar(1 / points.length);
+
+  const up = new THREE.Vector3(0, 1, 0);
+
+  // stima asse orizzontale "right" dal farthest pair su XZ
+  let bestI = 0;
+  let bestJ = 1;
+  let bestD = -1;
+
+  for (let i = 0; i < points.length; i++) {
+    for (let j = i + 1; j < points.length; j++) {
+      const a = points[i];
+      const b = points[j];
+      const dx = a.x - b.x;
+      const dz = a.z - b.z;
+      const d = dx * dx + dz * dz; // distanza su XZ
+      if (d > bestD) {
+        bestD = d;
+        bestI = i;
+        bestJ = j;
+      }
+    }
+  }
+
+  const right = points[bestJ].clone().sub(points[bestI]);
+  right.y = 0; // forza orizzontale
+  if (right.lengthSq() < 1e-10) return null;
+  right.normalize();
+
+  const forward = new THREE.Vector3().crossVectors(up, right).normalize();
+  if (forward.lengthSq() < 1e-10) return null;
+
+  // proietta su right (orizzontale) e up (verticale)
+  let minR = Infinity,
+      maxR = -Infinity,
+      minU = Infinity,
+      maxU = -Infinity;
+
+  for (const p of points) {
+    const d = p.clone().sub(c);
+    const pr = d.dot(right);
+    const pu = d.dot(up);
+    minR = Math.min(minR, pr);
+    maxR = Math.max(maxR, pr);
+    minU = Math.min(minU, pu);
+    maxU = Math.max(maxU, pu);
+  }
+
+  const width = Math.max(0.0001, maxR - minR);
+  const height = Math.max(0.0001, maxU - minU);
+
+  // corners: A(bottom-left), B(bottom-right), C(top-right), D(top-left)
+  const A = c.clone().add(right.clone().multiplyScalar(minR)).add(up.clone().multiplyScalar(minU));
+  const B = c.clone().add(right.clone().multiplyScalar(maxR)).add(up.clone().multiplyScalar(minU));
+  const Cc = c.clone().add(right.clone().multiplyScalar(maxR)).add(up.clone().multiplyScalar(maxU));
+  const D = c.clone().add(right.clone().multiplyScalar(minR)).add(up.clone().multiplyScalar(maxU));
+
+  // orientamento: x=right, y=up, z=forward
+  const basis = new THREE.Matrix4().makeBasis(right, up, forward);
+  const q = new THREE.Quaternion().setFromRotationMatrix(basis);
+
+  // centro del rettangolo (meglio del centroid del tratto)
+  const center = c
+      .clone()
+      .add(right.clone().multiplyScalar((minR + maxR) * 0.5))
+      .add(up.clone().multiplyScalar((minU + maxU) * 0.5));
+
+  return {
+    corners: [A, B, Cc, D],
+    center,
+    quaternion: q,
+    width,
+    height,
+    right,
+    up,
+    forward,
   };
 }
 

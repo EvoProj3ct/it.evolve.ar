@@ -1,11 +1,11 @@
 import * as THREE from "three";
 
-export function makeGoldenTrail() {
+export function makeGoldenTrail(opts?: { color?: number }) {
   const points: THREE.Vector3[] = [];
   const geom = new THREE.BufferGeometry();
 
   const mat = new THREE.LineBasicMaterial({
-    color: 0xffd700,
+    color: opts?.color ?? 0xffd700,
     transparent: true,
     opacity: 0.9,
   });
@@ -14,6 +14,7 @@ export function makeGoldenTrail() {
 
   function rebuild() {
     geom.setFromPoints(points);
+    geom.computeBoundingSphere?.();
   }
 
   return {
@@ -28,6 +29,10 @@ export function makeGoldenTrail() {
       if (last && last.distanceToSquared(p) < 0.0002) return;
       points.push(p.clone());
       rebuild();
+    },
+    setColor(hex: number) {
+      mat.color.setHex(hex);
+      mat.needsUpdate = true;
     },
   };
 }
