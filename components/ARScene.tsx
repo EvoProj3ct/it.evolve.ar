@@ -47,9 +47,16 @@ export default function ARScene() {
   const sessionRef = useRef<XRSession | null>(null);
   const refSpaceRef = useRef<XRReferenceSpace | null>(null);
 
-  // ✅ niente any
+  // touch input (per targetRaySpace)
   const transientHitTestSourceRef = useRef<XRTransientInputHitTestSource | null>(null);
 
+  // ✅ viewer hit-test (per incollare a muro/porta)
+  const viewerHitTestSourceRef = useRef<XRHitTestSource | null>(null);
+
+  // ✅ salva ultimo frame per usare hit-test nel pointerUp
+  const lastFrameRef = useRef<XRFrame | null>(null);
+
+  // Anchors
   const anchorsSupportedRef = useRef(false);
   const anchoredRef = useRef<Anchored[]>([]);
   const placedRef = useRef<THREE.Object3D[]>([]);
@@ -59,23 +66,14 @@ export default function ARScene() {
   const [colorKey, setColorKey] = useState<ColorKey>("magenta");
   const thicknessRef = useRef(0.06);
 
+  // piano davanti (fallback)
   const drawPlaneRef = useRef<Plane | null>(null);
   const drawDistanceRef = useRef(1.6);
 
+  // correzione percezione dito
+  const touchYOffsetRef = useRef(0.0);
+
   const previewThrottleRef = useRef(0);
-
-  const resizeToContainer = () => {
-    const container = containerRef.current;
-    const renderer = rendererRef.current;
-    if (!container || !renderer) return;
-
-    const rect = container.getBoundingClientRect();
-    const w = Math.max(1, Math.floor(rect.width));
-    const h = Math.max(1, Math.floor(rect.height));
-
-    renderer.setSize(w, h, false);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  };
 
   useEffect(() => {
     const container = containerRef.current!;
@@ -114,9 +112,13 @@ export default function ARScene() {
 
     threeRef.current = { scene, camera, root, trail, preview };
 
-    resizeToContainer();
-
-    const ro = new ResizeObserver(() => resizeToContainer());
+    const ro = new ResizeObserver(() => {
+      const rect = container.getBoundingClientRect();
+      const w = Math.max(1, Math.floor(rect.width));
+      const h = Math.max(1, Math.floor(rect.height));
+      renderer.setSize(w, h, false);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    });
     ro.observe(container);
 
     return () => {
@@ -158,7 +160,8 @@ export default function ARScene() {
     } as XRSessionInit);
 
     sessionRef.current = session;
-    anchorsSupportedRef.current = typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor === "function";
+    anchorsSupportedRef.current =
+        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor === "function";
 
     const renderer = rendererRef.current!;
     renderer.setClearColor(0x000000, 0);
@@ -169,6 +172,7 @@ export default function ARScene() {
     const refSpace = await session.requestReferenceSpace("local");
     refSpaceRef.current = refSpace;
 
+    // touch transient
     try {
       transientHitTestSourceRef.current =
           (await session.requestHitTestSourceForTransientInput?.({
@@ -176,11 +180,22 @@ export default function ARScene() {
           })) ?? null;
     } catch {
       transientHitTestSourceRef.current = null;
-      setStatus("Touch input XR non disponibile.");
+    }
+
+    // ✅ viewer hit-test
+    try {
+      const viewerSpace = await session.requestReferenceSpace("viewer");
+      viewerHitTestSourceRef.current =
+          (await session.requestHitTestSource?.({ space: viewerSpace })) ?? null;
+    } catch {
+      viewerHitTestSourceRef.current = null;
     }
 
     session.addEventListener("end", () => {
       transientHitTestSourceRef.current = null;
+      viewerHitTestSourceRef.current = null;
+      lastFrameRef.current = null;
+
       refSpaceRef.current = null;
       sessionRef.current = null;
 
@@ -201,11 +216,13 @@ export default function ARScene() {
     });
 
     setIsRunning(true);
-    setStatus("AR avviata. Tieni premuto e contorna l’apertura.");
+    setStatus("AR avviata. Tieni premuto e contorna il vano.");
 
     renderer.setAnimationLoop((_time, frame) => {
       const three = threeRef.current!;
       const refSpaceNow = refSpaceRef.current!;
+
+      lastFrameRef.current = frame ?? null;
 
       if (frame && drawRef.current.drawing) {
         const pt = pointFromTouchOnDrawPlane(frame, refSpaceNow);
@@ -227,7 +244,12 @@ export default function ARScene() {
           if (!pose) continue;
           const t = pose.transform;
           item.obj.position.set(t.position.x, t.position.y, t.position.z);
-          item.obj.quaternion.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+          item.obj.quaternion.set(
+              t.orientation.x,
+              t.orientation.y,
+              t.orientation.z,
+              t.orientation.w
+          );
         }
       }
 
@@ -246,9 +268,9 @@ export default function ARScene() {
     drawRef.current = { drawing: true, pointsWorld: [] };
     previewThrottleRef.current = 0;
 
+    // fallback plane davanti alla camera
     const renderer = rendererRef.current!;
     const cam = renderer.xr.getCamera() as unknown as THREE.Camera;
-
 
     const camPos = new THREE.Vector3();
     cam.getWorldPosition(camPos);
@@ -262,7 +284,7 @@ export default function ARScene() {
     three.preview.clear();
     three.preview.visible = true;
 
-    setStatus("Traccio (piano davanti a te)…");
+    setStatus("Traccio…");
   }
 
   async function onPointerUp() {
@@ -276,17 +298,23 @@ export default function ARScene() {
     three.preview.clear();
 
     if (pts.length < 10) {
-      setStatus("Tratto troppo corto. Contorna meglio l’apertura.");
+      setStatus("Tratto troppo corto.");
       three.trail.reset();
       return;
     }
 
-    const rect = fitVerticalRectFromStroke(pts);
-    if (!rect) {
+    // ✅ FIX TS: rect può essere null, quindi guard
+    const rect0 = fitVerticalRectFromStroke(pts);
+    if (!rect0) {
       setStatus("Non riesco a stimare un rettangolo. Riprova.");
       three.trail.reset();
       return;
     }
+
+    // ✅ SNAP SU MURO/PORTA (se disponibile)
+    const snapped = snapRectToViewerHit(rect0);
+
+    const rect = snapped.rect;
 
     const box = makeWindowBox(rect, {
       thickness: thicknessRef.current,
@@ -296,6 +324,7 @@ export default function ARScene() {
     three.root.add(box);
     placedRef.current.push(box);
 
+    // ✅ ancora sul pose snappato (se anchors disponibili)
     const session = sessionRef.current;
     const refSpace = refSpaceRef.current;
     if (session && refSpace && anchorsSupportedRef.current) {
@@ -304,8 +333,10 @@ export default function ARScene() {
             { x: rect.center.x, y: rect.center.y, z: rect.center.z },
             { x: rect.quaternion.x, y: rect.quaternion.y, z: rect.quaternion.z, w: rect.quaternion.w }
         );
-        const anchor = await (session as unknown as { requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor> })
-            .requestAnchor(xrTransform, refSpace);
+        const anchor = await (session as unknown as {
+          requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor>;
+        }).requestAnchor(xrTransform, refSpace);
+
         anchoredRef.current.push({ anchor, obj: box });
       } catch {}
     }
@@ -313,7 +344,7 @@ export default function ARScene() {
     three.trail.reset();
     drawPlaneRef.current = null;
 
-    setStatus("Rettangolo creato davanti a te. Undo per annullare.");
+    setStatus(snapped.didSnap ? "Incollato al muro/porta ✅" : "Creato (nessun piano trovato)");
   }
 
   function updatePreview(points: THREE.Vector3[]) {
@@ -352,7 +383,71 @@ export default function ARScene() {
         .applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w))
         .normalize();
 
-    return intersectRayPlane(origin, dir, plane.point, plane.normal);
+    const p = intersectRayPlane(origin, dir, plane.point, plane.normal);
+    if (!p) return null;
+
+    if (touchYOffsetRef.current !== 0) {
+      p.add(new THREE.Vector3(0, 1, 0).multiplyScalar(touchYOffsetRef.current));
+    }
+    return p;
+  }
+
+  /**
+   * ✅ Qui avviene la magia: incolla su un piano reale usando hit-test viewer.
+   * - usa lastFrameRef (frame più recente)
+   * - prende il primo hit
+   * - sposta il centro del rettangolo sulla posa (posizione)
+   * - ruota il rettangolo perché sia PARALLELO al muro (z = normale del muro)
+   */
+  function snapRectToViewerHit(rect: {
+    center: THREE.Vector3;
+    width: number;
+    height: number;
+    quaternion: THREE.Quaternion;
+  }): { rect: typeof rect; didSnap: boolean } {
+    const frame = lastFrameRef.current;
+    const refSpace = refSpaceRef.current;
+    const src = viewerHitTestSourceRef.current;
+
+    if (!frame || !refSpace || !src || !frame.getHitTestResults) {
+      return { rect, didSnap: false };
+    }
+
+    const hits = frame.getHitTestResults(src);
+    if (!hits || hits.length === 0) return { rect, didSnap: false };
+
+    const pose = hits[0].getPose(refSpace);
+    if (!pose) return { rect, didSnap: false };
+
+    const t = pose.transform;
+    const hitPos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
+
+    // normale del muro: applica orientamento hit alla direzione -Z locale
+    const hitQ = new THREE.Quaternion(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+    const wallNormal = new THREE.Vector3(0, 0, -1).applyQuaternion(hitQ).normalize();
+
+    // vogliamo un rettangolo verticale (up = Y) e "front" = wallNormal
+    const up = new THREE.Vector3(0, 1, 0);
+    let right = new THREE.Vector3().crossVectors(up, wallNormal);
+    if (right.lengthSq() < 1e-8) {
+      // caso raro: normal quasi parallela a up -> fallback
+      right = new THREE.Vector3(1, 0, 0);
+    } else {
+      right.normalize();
+    }
+
+    const forward = wallNormal.clone().normalize(); // “fuori dal muro”
+    const basis = new THREE.Matrix4().makeBasis(right, up, forward);
+    const snappedQ = new THREE.Quaternion().setFromRotationMatrix(basis);
+
+    // ✅ porta il rettangolo sulla profondità reale, mantenendo la stessa misura
+    const snappedRect = {
+      ...rect,
+      center: hitPos,
+      quaternion: snappedQ,
+    };
+
+    return { rect: snappedRect, didSnap: true };
   }
 
   function undoLast() {
@@ -377,7 +472,7 @@ export default function ARScene() {
     three.root.remove(last);
     disposeObject(last);
 
-    setStatus("Ultimo rettangolo rimosso.");
+    setStatus("Ultimo rimosso.");
   }
 
   function clearAll() {
@@ -415,7 +510,7 @@ export default function ARScene() {
           onPointerDown={onPointerDown}
           onPointerUp={onPointerUp}
       >
-        <div className="pointer-events-none absolute left-3 top-3 z-10 max-w-[460px]">
+        <div className="pointer-events-none absolute left-3 top-3 z-10 max-w-[560px]">
           <div className="pointer-events-none mb-2 text-sm text-white [text-shadow:_0_1px_2px_rgba(0,0,0,0.85)]">
             {status}
           </div>
@@ -490,6 +585,23 @@ export default function ARScene() {
                   onChange={(e) => (drawDistanceRef.current = Number(e.target.value))}
               />
             </div>
+
+            <div className="flex items-center gap-1 rounded-lg border border-white/20 bg-black/40 px-2 py-1 text-white backdrop-blur">
+              <span className="text-xs opacity-80">Y</span>
+              <input
+                  type="range"
+                  min={-0.5}
+                  max={0.5}
+                  step={0.01}
+                  defaultValue={touchYOffsetRef.current}
+                  onChange={(e) => (touchYOffsetRef.current = Number(e.target.value))}
+              />
+            </div>
+          </div>
+
+          <div className="pointer-events-none mt-2 text-xs text-white/80">
+            Ora: al rilascio prova a <b>incollare al muro/porta</b> usando hit-test viewer (centro schermo).
+            Se non trova piani, resta sul piano “davanti a te”.
           </div>
         </div>
       </div>
@@ -520,7 +632,6 @@ function makePreviewRect(rect: { corners: THREE.Vector3[] }, opts: { color: numb
     corners[0].x, corners[0].y, corners[0].z,
     corners[1].x, corners[1].y, corners[1].z,
     corners[2].x, corners[2].y, corners[2].z,
-
     corners[2].x, corners[2].y, corners[2].z,
     corners[3].x, corners[3].y, corners[3].z,
     corners[0].x, corners[0].y, corners[0].z,
