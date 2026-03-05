@@ -7,7 +7,7 @@ export function makeGoldenTrail(opts?: { color?: number }) {
   const mat = new THREE.LineBasicMaterial({
     color: opts?.color ?? 0xffd700,
     transparent: true,
-    opacity: 0.9,
+    opacity: 0.95,
   });
 
   const line = new THREE.Line(geom, mat);
@@ -24,9 +24,9 @@ export function makeGoldenTrail(opts?: { color?: number }) {
       rebuild();
     },
     pushPoint(p: THREE.Vector3) {
-      // evita punti troppo vicini (riduce tremolio e peso)
       const last = points[points.length - 1];
-      if (last && last.distanceToSquared(p) < 0.0002) return;
+      // più fitto = più “matita”
+      if (last && last.distanceToSquared(p) < 0.00005) return;
       points.push(p.clone());
       rebuild();
     },

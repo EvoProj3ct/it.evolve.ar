@@ -16,6 +16,19 @@ const COLORS: Record<ColorKey, number> = {
   white: 0xffffff,
 };
 
+type Plane = { point: THREE.Vector3; normal: THREE.Vector3 };
+
+function isMaterialWithColor(
+    m: unknown
+): m is THREE.Material & { color: THREE.Color; needsUpdate: boolean } {
+  return (
+      typeof m === "object" &&
+      m !== null &&
+      "color" in (m as Record<string, unknown>) &&
+      (m as { color?: unknown }).color instanceof THREE.Color
+  );
+}
+
 export default function ARScene() {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
@@ -25,7 +38,7 @@ export default function ARScene() {
     camera: THREE.PerspectiveCamera;
     root: THREE.Group;
     trail: ReturnType<typeof makeGoldenTrail>;
-    preview: THREE.Group; // rettangolo mentre traccio
+    preview: THREE.Group;
   } | null>(null);
 
   const [status, setStatus] = useState("Pronto");
@@ -34,18 +47,21 @@ export default function ARScene() {
   const sessionRef = useRef<XRSession | null>(null);
   const refSpaceRef = useRef<XRReferenceSpace | null>(null);
 
-  // Touch hit-test (transient input)
-  const transientHitTestSourceRef = useRef<any>(null);
+  // ✅ niente any
+  const transientHitTestSourceRef = useRef<XRTransientInputHitTestSource | null>(null);
 
-  // Anchors
   const anchorsSupportedRef = useRef(false);
   const anchoredRef = useRef<Anchored[]>([]);
   const placedRef = useRef<THREE.Object3D[]>([]);
 
   const drawRef = useRef<DrawState>({ drawing: false, pointsWorld: [] });
 
-  const [colorKey, setColorKey] = useState<ColorKey>("gold");
-  const thicknessRef = useRef(0.06); // spessore parallelepipedo (metri)
+  const [colorKey, setColorKey] = useState<ColorKey>("magenta");
+  const thicknessRef = useRef(0.06);
+
+  const drawPlaneRef = useRef<Plane | null>(null);
+  const drawDistanceRef = useRef(1.6);
+
   const previewThrottleRef = useRef(0);
 
   const resizeToContainer = () => {
@@ -70,7 +86,6 @@ export default function ARScene() {
     });
 
     renderer.xr.enabled = true;
-
     renderer.setClearColor(0x000000, 0);
     renderer.setClearAlpha(0);
 
@@ -85,7 +100,6 @@ export default function ARScene() {
     const root = new THREE.Group();
     scene.add(root);
 
-    // luci un po’ più utili per leggere i box
     scene.add(new THREE.HemisphereLight(0xffffff, 0x222222, 1.1));
     const dir = new THREE.DirectionalLight(0xffffff, 0.6);
     dir.position.set(1, 2, 1);
@@ -94,7 +108,6 @@ export default function ARScene() {
     const trail = makeGoldenTrail({ color: COLORS[colorKey] });
     root.add(trail.object);
 
-    // preview group (rettangolo “fantasma” mentre traccio)
     const preview = new THREE.Group();
     preview.visible = false;
     root.add(preview);
@@ -120,20 +133,17 @@ export default function ARScene() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // quando cambio colore: aggiorna trail + preview + futuri box
   useEffect(() => {
     const three = threeRef.current;
     if (!three) return;
-
     three.trail.setColor(COLORS[colorKey]);
-    // aggiorna anche preview se esiste
-    setPreviewColor(three.preview, COLORS[colorKey]);
+    setGroupColor(three.preview, COLORS[colorKey]);
   }, [colorKey]);
 
   async function startAR() {
     if (isRunning) return;
 
-    const xr = (navigator as any).xr as XRSystem | undefined;
+    const xr = (navigator as unknown as { xr?: XRSystem }).xr;
     if (!xr) {
       setStatus("WebXR non disponibile");
       return;
@@ -145,10 +155,10 @@ export default function ARScene() {
       requiredFeatures: ["hit-test"],
       optionalFeatures: ["anchors", "dom-overlay", "local-floor"],
       domOverlay: { root: document.body },
-    } as any);
+    } as XRSessionInit);
 
     sessionRef.current = session;
-    anchorsSupportedRef.current = typeof (session as any).requestAnchor === "function";
+    anchorsSupportedRef.current = typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor === "function";
 
     const renderer = rendererRef.current!;
     renderer.setClearColor(0x000000, 0);
@@ -161,12 +171,12 @@ export default function ARScene() {
 
     try {
       transientHitTestSourceRef.current =
-          await (session as any).requestHitTestSourceForTransientInput({
+          (await session.requestHitTestSourceForTransientInput?.({
             profile: "generic-touchscreen",
-          });
+          })) ?? null;
     } catch {
       transientHitTestSourceRef.current = null;
-      setStatus("Hit-test touch non disponibile (generic-touchscreen).");
+      setStatus("Touch input XR non disponibile.");
     }
 
     session.addEventListener("end", () => {
@@ -184,46 +194,40 @@ export default function ARScene() {
         three.trail.reset();
       }
 
+      drawPlaneRef.current = null;
+
       setIsRunning(false);
       setStatus("Sessione AR terminata");
     });
 
     setIsRunning(true);
-    setStatus("AR avviata. Tieni premuto e traccia il perimetro del vano.");
+    setStatus("AR avviata. Tieni premuto e contorna l’apertura.");
 
     renderer.setAnimationLoop((_time, frame) => {
       const three = threeRef.current!;
       const refSpaceNow = refSpaceRef.current!;
 
+      if (frame && drawRef.current.drawing) {
+        const pt = pointFromTouchOnDrawPlane(frame, refSpaceNow);
+        if (pt) {
+          drawRef.current.pointsWorld.push(pt);
+          three.trail.pushPoint(pt);
+
+          const now = performance.now();
+          if (now - previewThrottleRef.current > 50) {
+            previewThrottleRef.current = now;
+            updatePreview(drawRef.current.pointsWorld);
+          }
+        }
+      }
+
       if (frame) {
-        // aggiorna ancore
         for (const item of anchoredRef.current) {
           const pose = frame.getPose(item.anchor.anchorSpace, refSpaceNow);
           if (!pose) continue;
           const t = pose.transform;
           item.obj.position.set(t.position.x, t.position.y, t.position.z);
-          item.obj.quaternion.set(
-              t.orientation.x,
-              t.orientation.y,
-              t.orientation.z,
-              t.orientation.w
-          );
-        }
-
-        // disegno live + preview
-        if (drawRef.current.drawing) {
-          const pt = hitTestFromTouch(frame, refSpaceNow);
-          if (pt) {
-            drawRef.current.pointsWorld.push(pt);
-            three.trail.pushPoint(pt);
-
-            // preview: throttling leggero per non ammazzare mobile
-            const now = performance.now();
-            if (now - previewThrottleRef.current > 60) {
-              previewThrottleRef.current = now;
-              updatePreviewFromStroke(drawRef.current.pointsWorld);
-            }
-          }
+          item.obj.quaternion.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
         }
       }
 
@@ -235,24 +239,6 @@ export default function ARScene() {
     sessionRef.current?.end();
   }
 
-  function hitTestFromTouch(frame: XRFrame, refSpace: XRReferenceSpace): THREE.Vector3 | null {
-    const tht = transientHitTestSourceRef.current;
-    if (!tht) return null;
-
-    const results = (frame as any).getHitTestResultsForTransientInput(tht) as any[];
-    if (!results?.length) return null;
-
-    const r0 = results[0];
-    const hitResults = r0.results as XRHitTestResult[];
-    if (!hitResults?.length) return null;
-
-    const pose = hitResults[0].getPose(refSpace);
-    if (!pose) return null;
-
-    const p = pose.transform.position;
-    return new THREE.Vector3(p.x, p.y, p.z);
-  }
-
   function onPointerDown() {
     if (!isRunning) return;
 
@@ -260,11 +246,23 @@ export default function ARScene() {
     drawRef.current = { drawing: true, pointsWorld: [] };
     previewThrottleRef.current = 0;
 
-    // reset trail e attiva preview
+    const renderer = rendererRef.current!;
+    const cam = renderer.xr.getCamera() as unknown as THREE.Camera;
+
+
+    const camPos = new THREE.Vector3();
+    cam.getWorldPosition(camPos);
+
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).normalize();
+    const pointOnPlane = camPos.clone().add(forward.clone().multiplyScalar(drawDistanceRef.current));
+
+    drawPlaneRef.current = { point: pointOnPlane, normal: forward };
+
     three.trail.reset();
-    three.preview.visible = true;
     three.preview.clear();
-    setStatus("Traccio…");
+    three.preview.visible = true;
+
+    setStatus("Traccio (piano davanti a te)…");
   }
 
   async function onPointerUp() {
@@ -274,25 +272,22 @@ export default function ARScene() {
     const pts = drawRef.current.pointsWorld;
     drawRef.current.drawing = false;
 
-    // nascondi preview (poi lo rimpiazziamo con box definitivo)
     three.preview.visible = false;
     three.preview.clear();
 
     if (pts.length < 10) {
-      setStatus("Tratto troppo corto. Tieni premuto e traccia un perimetro più ampio.");
+      setStatus("Tratto troppo corto. Contorna meglio l’apertura.");
       three.trail.reset();
       return;
     }
 
-    // ✅ rettangolo VERTICALE (dritto) pensato per vani finestre/aperture
     const rect = fitVerticalRectFromStroke(pts);
     if (!rect) {
-      setStatus("Non riesco a stimare un rettangolo verticale. Riprova.");
+      setStatus("Non riesco a stimare un rettangolo. Riprova.");
       three.trail.reset();
       return;
     }
 
-    // ✅ crea parallelepipedo “fine”
     const box = makeWindowBox(rect, {
       thickness: thicknessRef.current,
       color: COLORS[colorKey],
@@ -301,45 +296,63 @@ export default function ARScene() {
     three.root.add(box);
     placedRef.current.push(box);
 
-    // anchor se disponibile
     const session = sessionRef.current;
     const refSpace = refSpaceRef.current;
-
     if (session && refSpace && anchorsSupportedRef.current) {
       try {
-        const xrTransform = new (window as any).XRRigidTransform(
+        const xrTransform = new XRRigidTransform(
             { x: rect.center.x, y: rect.center.y, z: rect.center.z },
-            {
-              x: rect.quaternion.x,
-              y: rect.quaternion.y,
-              z: rect.quaternion.z,
-              w: rect.quaternion.w,
-            }
+            { x: rect.quaternion.x, y: rect.quaternion.y, z: rect.quaternion.z, w: rect.quaternion.w }
         );
-        const anchor = await (session as any).requestAnchor(xrTransform, refSpace);
+        const anchor = await (session as unknown as { requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor> })
+            .requestAnchor(xrTransform, refSpace);
         anchoredRef.current.push({ anchor, obj: box });
-      } catch {
-        // ok, resta senza anchor
-      }
+      } catch {}
     }
 
-    // pulisci trail dopo aver “stampato”
     three.trail.reset();
-    setStatus("OK. Rettangolo creato. Puoi disegnare un altro (Undo per annullare).");
+    drawPlaneRef.current = null;
+
+    setStatus("Rettangolo creato davanti a te. Undo per annullare.");
   }
 
-  function updatePreviewFromStroke(points: THREE.Vector3[]) {
+  function updatePreview(points: THREE.Vector3[]) {
     const three = threeRef.current;
     if (!three) return;
 
     const rect = fitVerticalRectFromStroke(points);
     if (!rect) return;
 
-    // (re)build preview: una cornice + un fill leggero
     three.preview.clear();
-    const g = makePreviewRect(rect, { color: COLORS[colorKey] });
-    three.preview.add(g);
+    three.preview.add(makePreviewRect(rect, { color: COLORS[colorKey] }));
     three.preview.visible = true;
+  }
+
+  function pointFromTouchOnDrawPlane(frame: XRFrame, refSpace: XRReferenceSpace): THREE.Vector3 | null {
+    const plane = drawPlaneRef.current;
+    if (!plane) return null;
+
+    const src = transientHitTestSourceRef.current;
+    if (!src) return null;
+
+    const list = frame.getHitTestResultsForTransientInput?.(src);
+    if (!list || list.length === 0) return null;
+
+    const inputSource = list[0].inputSource;
+    if (!inputSource?.targetRaySpace) return null;
+
+    const pose = frame.getPose(inputSource.targetRaySpace, refSpace);
+    if (!pose) return null;
+
+    const o = pose.transform.position;
+    const q = pose.transform.orientation;
+
+    const origin = new THREE.Vector3(o.x, o.y, o.z);
+    const dir = new THREE.Vector3(0, 0, -1)
+        .applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w))
+        .normalize();
+
+    return intersectRayPlane(origin, dir, plane.point, plane.normal);
   }
 
   function undoLast() {
@@ -352,20 +365,17 @@ export default function ARScene() {
       return;
     }
 
-    // rimuovi anche eventuale anchor collegata
     const idx = anchoredRef.current.findIndex((a) => a.obj === last);
     if (idx >= 0) {
       const a = anchoredRef.current[idx];
       anchoredRef.current.splice(idx, 1);
       try {
-        (a.anchor as any).delete?.();
+        (a.anchor as unknown as { delete?: () => void }).delete?.();
       } catch {}
     }
 
-    try {
-      three.root.remove(last);
-      disposeObject(last);
-    } catch {}
+    three.root.remove(last);
+    disposeObject(last);
 
     setStatus("Ultimo rettangolo rimosso.");
   }
@@ -376,26 +386,23 @@ export default function ARScene() {
 
     for (const a of anchoredRef.current) {
       try {
-        (a.anchor as any).delete?.();
+        (a.anchor as unknown as { delete?: () => void }).delete?.();
       } catch {}
-      try {
-        three.root.remove(a.obj);
-        disposeObject(a.obj);
-      } catch {}
+      three.root.remove(a.obj);
+      disposeObject(a.obj);
     }
     anchoredRef.current = [];
 
     for (const obj of placedRef.current) {
-      try {
-        three.root.remove(obj);
-        disposeObject(obj);
-      } catch {}
+      three.root.remove(obj);
+      disposeObject(obj);
     }
     placedRef.current = [];
 
     three.preview.clear();
     three.preview.visible = false;
     three.trail.reset();
+    drawPlaneRef.current = null;
 
     setStatus("Tutto cancellato.");
   }
@@ -471,6 +478,18 @@ export default function ARScene() {
                   onChange={(e) => (thicknessRef.current = Number(e.target.value))}
               />
             </div>
+
+            <div className="flex items-center gap-1 rounded-lg border border-white/20 bg-black/40 px-2 py-1 text-white backdrop-blur">
+              <span className="text-xs opacity-80">Dist.</span>
+              <input
+                  type="range"
+                  min={0.6}
+                  max={3.5}
+                  step={0.1}
+                  defaultValue={drawDistanceRef.current}
+                  onChange={(e) => (drawDistanceRef.current = Number(e.target.value))}
+              />
+            </div>
           </div>
         </div>
       </div>
@@ -479,36 +498,32 @@ export default function ARScene() {
 
 /* ---------------- helpers ---------------- */
 
-function makePreviewRect(
-    rect: { corners: THREE.Vector3[] },
-    opts: { color: number }
-): THREE.Group {
-  const g = new THREE.Group();
+function intersectRayPlane(
+    rayOrigin: THREE.Vector3,
+    rayDir: THREE.Vector3,
+    planePoint: THREE.Vector3,
+    planeNormal: THREE.Vector3
+): THREE.Vector3 | null {
+  const denom = planeNormal.dot(rayDir);
+  if (Math.abs(denom) < 1e-6) return null;
+  const t = planePoint.clone().sub(rayOrigin).dot(planeNormal) / denom;
+  if (t < 0) return null;
+  return rayOrigin.clone().add(rayDir.clone().multiplyScalar(t));
+}
 
+function makePreviewRect(rect: { corners: THREE.Vector3[] }, opts: { color: number }): THREE.Group {
+  const g = new THREE.Group();
   const corners = rect.corners;
 
-  // fill leggero
   const fillGeom = new THREE.BufferGeometry();
   const v = new Float32Array([
-    corners[0].x,
-    corners[0].y,
-    corners[0].z,
-    corners[1].x,
-    corners[1].y,
-    corners[1].z,
-    corners[2].x,
-    corners[2].y,
-    corners[2].z,
+    corners[0].x, corners[0].y, corners[0].z,
+    corners[1].x, corners[1].y, corners[1].z,
+    corners[2].x, corners[2].y, corners[2].z,
 
-    corners[2].x,
-    corners[2].y,
-    corners[2].z,
-    corners[3].x,
-    corners[3].y,
-    corners[3].z,
-    corners[0].x,
-    corners[0].y,
-    corners[0].z,
+    corners[2].x, corners[2].y, corners[2].z,
+    corners[3].x, corners[3].y, corners[3].z,
+    corners[0].x, corners[0].y, corners[0].z,
   ]);
   fillGeom.setAttribute("position", new THREE.BufferAttribute(v, 3));
   fillGeom.computeVertexNormals();
@@ -521,34 +536,20 @@ function makePreviewRect(
     depthWrite: false,
   });
 
-  const fill = new THREE.Mesh(fillGeom, fillMat);
-  g.add(fill);
+  g.add(new THREE.Mesh(fillGeom, fillMat));
 
-  // cornice
   const lineGeom = new THREE.BufferGeometry().setFromPoints([...corners, corners[0]]);
-  const lineMat = new THREE.LineBasicMaterial({
-    color: opts.color,
-    transparent: true,
-    opacity: 0.95,
-  });
-  const line = new THREE.Line(lineGeom, lineMat);
-  g.add(line);
+  const lineMat = new THREE.LineBasicMaterial({ color: opts.color, transparent: true, opacity: 0.95 });
+  g.add(new THREE.Line(lineGeom, lineMat));
 
   return g;
 }
 
 function makeWindowBox(
-    rect: {
-      center: THREE.Vector3;
-      width: number;
-      height: number;
-      quaternion: THREE.Quaternion;
-    },
+    rect: { center: THREE.Vector3; width: number; height: number; quaternion: THREE.Quaternion },
     opts: { thickness: number; color: number }
 ) {
-  // box geometry centrata, poi applichiamo posizione + rotazione
   const geom = new THREE.BoxGeometry(rect.width, rect.height, opts.thickness);
-
   const mat = new THREE.MeshStandardMaterial({
     color: opts.color,
     transparent: true,
@@ -561,34 +562,42 @@ function makeWindowBox(
   mesh.position.copy(rect.center);
   mesh.quaternion.copy(rect.quaternion);
 
-  // outline
   const edges = new THREE.EdgesGeometry(geom);
-  const line = new THREE.LineSegments(
-      edges,
-      new THREE.LineBasicMaterial({ color: opts.color, transparent: true, opacity: 0.95 })
+  mesh.add(
+      new THREE.LineSegments(
+          edges,
+          new THREE.LineBasicMaterial({ color: opts.color, transparent: true, opacity: 0.95 })
+      )
   );
-  mesh.add(line);
-
   return mesh;
 }
 
-function setPreviewColor(previewGroup: THREE.Group, color: number) {
-  previewGroup.traverse((obj) => {
-    const anyObj: any = obj;
-    if (anyObj.material?.color) {
-      anyObj.material.color.setHex(color);
-      anyObj.material.needsUpdate = true;
+function setGroupColor(group: THREE.Group, color: number) {
+  group.traverse((obj) => {
+    const o = obj as unknown as { material?: unknown };
+    const m = o.material;
+
+    if (Array.isArray(m)) {
+      for (const mm of m) {
+        if (isMaterialWithColor(mm)) {
+          mm.color.setHex(color);
+          mm.needsUpdate = true;
+        }
+      }
+    } else if (isMaterialWithColor(m)) {
+      m.color.setHex(color);
+      m.needsUpdate = true;
     }
   });
 }
 
 function disposeObject(obj: THREE.Object3D) {
   obj.traverse((o) => {
-    const anyO: any = o;
-    if (anyO.geometry) anyO.geometry.dispose?.();
-    if (anyO.material) {
-      if (Array.isArray(anyO.material)) anyO.material.forEach((m: any) => m.dispose?.());
-      else anyO.material.dispose?.();
-    }
+    const oo = o as unknown as { geometry?: THREE.BufferGeometry; material?: THREE.Material | THREE.Material[] };
+    oo.geometry?.dispose?.();
+
+    const m = oo.material;
+    if (Array.isArray(m)) m.forEach((mm) => mm.dispose?.());
+    else m?.dispose?.();
   });
 }
