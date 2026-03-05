@@ -66,7 +66,11 @@ export default function ARScene() {
   const drawPlaneRef = useRef<Plane | null>(null);
 
   // assi del piano (right/up) bloccati al down
-  const planeAxesRef = useRef<{ right: THREE.Vector3; up: THREE.Vector3; forward: THREE.Vector3 } | null>(null);
+  const planeAxesRef = useRef<{
+    right: THREE.Vector3;
+    up: THREE.Vector3;
+    forward: THREE.Vector3;
+  } | null>(null);
 
   // rettangolo in drag: cornerA (down) + cornerB (current)
   const dragRef = useRef<{
@@ -104,6 +108,11 @@ export default function ARScene() {
     renderer.domElement.style.height = "100%";
     renderer.domElement.style.display = "block";
 
+    // ✅ FIX UI: il canvas NON deve intercettare i click/touch
+    renderer.domElement.style.pointerEvents = "none";
+    renderer.domElement.style.zIndex = "0";
+    container.style.position = "relative"; // per z-index/layout consistenti
+
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -134,7 +143,7 @@ export default function ARScene() {
       const w = Math.max(1, Math.floor(rect.width));
       const h = Math.max(1, Math.floor(rect.height));
 
-      // ✅ FIX 1: true = aggiorna anche CSS size
+      // ✅ FIX: true = aggiorna anche CSS size
       renderer.setSize(w, h, true);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     });
@@ -287,6 +296,9 @@ export default function ARScene() {
   function onPointerDown(e: React.PointerEvent) {
     if (!isRunning) return;
 
+    // ✅ FIX UI: se il tap è su un controllo, non iniziare il draw
+    if ((e.target as HTMLElement).closest("button,select,input,textarea,label,a")) return;
+
     pointerRef.current = { x: e.clientX, y: e.clientY, active: true };
     previewThrottleRef.current = 0;
 
@@ -416,7 +428,7 @@ export default function ARScene() {
     three.trail.pushPoint(b);
   }
 
-  // ✅ FIX VER0: NDC calcolato sul viewport XR (quando presente)
+  // ✅ NDC calcolato sul viewport XR (quando presente)
   function pointFromScreenOnDrawPlane(): THREE.Vector3 | null {
     const plane = drawPlaneRef.current;
     const renderer = rendererRef.current;
@@ -426,23 +438,22 @@ export default function ARScene() {
     const canvasRect = renderer.domElement.getBoundingClientRect();
     const dpr = renderer.getPixelRatio();
 
-    // pixel nel canvas (render target)
     const px = (pointerRef.current.x - canvasRect.left) * dpr;
     const py = (pointerRef.current.y - canvasRect.top) * dpr;
 
     const xrCam = (renderer.xr as unknown as {
-      getCamera: () => THREE.Camera & { cameras?: Array<THREE.Camera & { viewport?: THREE.Vector4 }> };
+      getCamera: () => THREE.Camera & {
+        cameras?: Array<THREE.Camera & { viewport?: THREE.Vector4 }>;
+      };
     }).getCamera();
 
-    // scegli camera/viewport (di solito cameras[0])
     const cam: THREE.Camera & { viewport?: THREE.Vector4 } =
         xrCam.cameras && xrCam.cameras.length > 0 ? (xrCam.cameras[0] as any) : (xrCam as any);
 
     cam.updateMatrixWorld(true);
 
-    // se c’è viewport, rimappa px/py dentro quel viewport
     if (cam.viewport) {
-      const vp = cam.viewport; // x,y,w,h in pixel
+      const vp = cam.viewport; // x,y,w,h (px)
       const vx = (px - vp.x) / vp.z;
       const vy = (py - vp.y) / vp.w;
 
@@ -454,7 +465,6 @@ export default function ARScene() {
       return intersectRayPlane(raycaster.ray.origin, raycaster.ray.direction, plane.point, plane.normal);
     }
 
-    // fallback: usa tutto il canvas
     const ndcX = (px / (canvasRect.width * dpr)) * 2 - 1;
     const ndcY = -((py / (canvasRect.height * dpr)) * 2 - 1);
 
@@ -531,7 +541,13 @@ export default function ARScene() {
             {status}
           </div>
 
-          <div className="pointer-events-auto flex flex-wrap gap-2">
+          {/* ✅ FIX UI: blocca la propagazione verso il container */}
+          <div
+              className="pointer-events-auto flex flex-wrap gap-2"
+              onPointerDownCapture={(e) => e.stopPropagation()}
+              onPointerMoveCapture={(e) => e.stopPropagation()}
+              onPointerUpCapture={(e) => e.stopPropagation()}
+          >
             <button
                 onClick={startAR}
                 disabled={isRunning}
@@ -604,7 +620,7 @@ export default function ARScene() {
           </div>
 
           <div className="pointer-events-none mt-2 text-xs text-white/80">
-            Ora il mapping usa il viewport XR della camera (niente offset verticale).
+            UI cliccabile ✅ (canvas pointer-events:none + stopPropagation sui controlli)
           </div>
         </div>
       </div>
