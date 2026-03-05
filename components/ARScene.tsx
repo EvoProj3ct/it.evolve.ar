@@ -66,11 +66,7 @@ export default function ARScene() {
   const drawPlaneRef = useRef<Plane | null>(null);
 
   // assi del piano (right/up) bloccati al down
-  const planeAxesRef = useRef<{
-    right: THREE.Vector3;
-    up: THREE.Vector3;
-    forward: THREE.Vector3;
-  } | null>(null);
+  const planeAxesRef = useRef<{ right: THREE.Vector3; up: THREE.Vector3; forward: THREE.Vector3 } | null>(null);
 
   // rettangolo in drag: cornerA (down) + cornerB (current)
   const dragRef = useRef<{
@@ -100,6 +96,13 @@ export default function ARScene() {
     renderer.xr.enabled = true;
     renderer.setClearColor(0x000000, 0);
     renderer.setClearAlpha(0);
+
+    // ✅ IMPORTANTISSIMO: canvas full overlay e allineato
+    renderer.domElement.style.position = "absolute";
+    renderer.domElement.style.inset = "0";
+    renderer.domElement.style.width = "100%";
+    renderer.domElement.style.height = "100%";
+    renderer.domElement.style.display = "block";
 
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
@@ -131,9 +134,8 @@ export default function ARScene() {
       const w = Math.max(1, Math.floor(rect.width));
       const h = Math.max(1, Math.floor(rect.height));
 
-      // ✅ FIX 1: aggiorna anche lo style del canvas (niente mismatch)
+      // ✅ FIX 1: true = aggiorna anche CSS size
       renderer.setSize(w, h, true);
-
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     });
     ro.observe(container);
@@ -178,8 +180,7 @@ export default function ARScene() {
 
     sessionRef.current = session;
     anchorsSupportedRef.current =
-        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor ===
-        "function";
+        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor === "function";
 
     const renderer = rendererRef.current!;
     await renderer.xr.setSession(session);
@@ -236,11 +237,7 @@ export default function ARScene() {
           const pose = hits[0].getPose(refSpaceNow);
           if (pose) {
             const t = pose.transform;
-            const hitPos = new THREE.Vector3(
-                t.position.x,
-                t.position.y,
-                t.position.z
-            );
+            const hitPos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
 
             const cam = getXRRenderCamera(rendererNow);
             const camPos = new THREE.Vector3();
@@ -249,10 +246,8 @@ export default function ARScene() {
             const rawDist = camPos.distanceTo(hitPos);
             const clamped = clamp(rawDist, 0.35, 4.0);
 
-            // smoothing: EMA
             const prev = autoDistRef.current;
-            autoDistRef.current =
-                prev == null ? clamped : prev * 0.85 + clamped * 0.15;
+            autoDistRef.current = prev == null ? clamped : prev * 0.85 + clamped * 0.15;
           }
         }
       }
@@ -262,7 +257,6 @@ export default function ARScene() {
         const b = pointFromScreenOnDrawPlane();
         if (b) {
           dragRef.current.b = b;
-
           const now = performance.now();
           if (now - previewThrottleRef.current > 30) {
             previewThrottleRef.current = now;
@@ -271,19 +265,14 @@ export default function ARScene() {
         }
       }
 
-      // 3) aggiorna ancore (pos+rot) se le usi
+      // 3) aggiorna ancore
       if (frame && refSpaceNow) {
         for (const item of anchoredRef.current) {
           const pose = frame.getPose(item.anchor.anchorSpace, refSpaceNow);
           if (!pose) continue;
           const t = pose.transform;
           item.obj.position.set(t.position.x, t.position.y, t.position.z);
-          item.obj.quaternion.set(
-              t.orientation.x,
-              t.orientation.y,
-              t.orientation.z,
-              t.orientation.w
-          );
+          item.obj.quaternion.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
         }
       }
 
@@ -310,27 +299,18 @@ export default function ARScene() {
     const camQ = new THREE.Quaternion();
     cam.getWorldQuaternion(camQ);
 
-    // forward camera
-    const forward = new THREE.Vector3(0, 0, -1)
-        .applyQuaternion(camQ)
-        .normalize();
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ).normalize();
 
-    // yaw-only forward (porta/finestra “verticale”)
     const forwardYaw = forward.clone();
     forwardYaw.y = 0;
     if (forwardYaw.lengthSq() < 1e-8) forwardYaw.set(0, 0, -1);
     forwardYaw.normalize();
 
-    // distanza: auto se disponibile, altrimenti slider
     const dist = clamp(autoDistRef.current ?? drawDistanceRef.current, 0.35, 4.0);
 
-    // piano “muro finto” davanti camera
-    const pointOnPlane = camPos
-        .clone()
-        .add(forwardYaw.clone().multiplyScalar(dist));
+    const pointOnPlane = camPos.clone().add(forwardYaw.clone().multiplyScalar(dist));
     drawPlaneRef.current = { point: pointOnPlane, normal: forwardYaw };
 
-    // assi sul piano: right = up x forward, up = world up
     const up = new THREE.Vector3(0, 1, 0);
     let right = new THREE.Vector3().crossVectors(up, forwardYaw);
     if (right.lengthSq() < 1e-8) right = new THREE.Vector3(1, 0, 0);
@@ -338,7 +318,6 @@ export default function ARScene() {
 
     planeAxesRef.current = { right, up, forward: forwardYaw };
 
-    // punto A = dito su piano
     const a = pointFromScreenOnDrawPlane();
     dragRef.current = { dragging: true, a, b: a };
 
@@ -348,9 +327,7 @@ export default function ARScene() {
     three.preview.visible = true;
 
     if (a) three.trail.pushPoint(a);
-    setStatus(
-        `Drag… (piano ~${dist.toFixed(2)}m, auto:${autoDistRef.current ? "si" : "no"})`
-    );
+    setStatus(`Drag… (piano ~${dist.toFixed(2)}m, auto:${autoDistRef.current ? "si" : "no"})`);
   }
 
   function onPointerMove(e: React.PointerEvent) {
@@ -398,19 +375,13 @@ export default function ARScene() {
     three.root.add(box);
     placedRef.current.push(box);
 
-    // anchor (opzionale): mantiene posizione/rot più stabile nel mondo
     const session = sessionRef.current;
     const refSpace = refSpaceRef.current;
     if (session && refSpace && anchorsSupportedRef.current) {
       try {
         const xrTransform = new XRRigidTransform(
             { x: rect.center.x, y: rect.center.y, z: rect.center.z },
-            {
-              x: rect.quaternion.x,
-              y: rect.quaternion.y,
-              z: rect.quaternion.z,
-              w: rect.quaternion.w,
-            }
+            { x: rect.quaternion.x, y: rect.quaternion.y, z: rect.quaternion.z, w: rect.quaternion.w }
         );
         const anchor = await (session as unknown as {
           requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor>;
@@ -440,39 +411,56 @@ export default function ARScene() {
     three.preview.add(makePreviewRectFromPose(rect, { color: COLORS[colorKey] }));
     three.preview.visible = true;
 
-    // trail “minimo”: metti solo i due punti
     three.trail.reset();
     three.trail.pushPoint(a);
     three.trail.pushPoint(b);
   }
 
-  // punto 3D: ray(dal dito) ∩ drawPlaneRef
+  // ✅ FIX VER0: NDC calcolato sul viewport XR (quando presente)
   function pointFromScreenOnDrawPlane(): THREE.Vector3 | null {
     const plane = drawPlaneRef.current;
     const renderer = rendererRef.current;
     if (!plane || !renderer) return null;
     if (!pointerRef.current.active) return null;
 
-    // ✅ FIX 2: usa il rettangolo del CANVAS, non del container
-    const rect = renderer.domElement.getBoundingClientRect();
+    const canvasRect = renderer.domElement.getBoundingClientRect();
+    const dpr = renderer.getPixelRatio();
 
-    const x = ((pointerRef.current.x - rect.left) / rect.width) * 2 - 1;
-    const y = -(((pointerRef.current.y - rect.top) / rect.height) * 2 - 1);
+    // pixel nel canvas (render target)
+    const px = (pointerRef.current.x - canvasRect.left) * dpr;
+    const py = (pointerRef.current.y - canvasRect.top) * dpr;
 
-    const cam = getXRRenderCamera(renderer);
+    const xrCam = (renderer.xr as unknown as {
+      getCamera: () => THREE.Camera & { cameras?: Array<THREE.Camera & { viewport?: THREE.Vector4 }> };
+    }).getCamera();
 
-    // ✅ micro-fix: matrix world aggiornata prima del ray
+    // scegli camera/viewport (di solito cameras[0])
+    const cam: THREE.Camera & { viewport?: THREE.Vector4 } =
+        xrCam.cameras && xrCam.cameras.length > 0 ? (xrCam.cameras[0] as any) : (xrCam as any);
+
     cam.updateMatrixWorld(true);
 
-    const raycaster = raycasterRef.current;
-    raycaster.setFromCamera(new THREE.Vector2(x, y), cam);
+    // se c’è viewport, rimappa px/py dentro quel viewport
+    if (cam.viewport) {
+      const vp = cam.viewport; // x,y,w,h in pixel
+      const vx = (px - vp.x) / vp.z;
+      const vy = (py - vp.y) / vp.w;
 
-    return intersectRayPlane(
-        raycaster.ray.origin,
-        raycaster.ray.direction,
-        plane.point,
-        plane.normal
-    );
+      const ndcX = vx * 2 - 1;
+      const ndcY = -(vy * 2 - 1);
+
+      const raycaster = raycasterRef.current;
+      raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), cam);
+      return intersectRayPlane(raycaster.ray.origin, raycaster.ray.direction, plane.point, plane.normal);
+    }
+
+    // fallback: usa tutto il canvas
+    const ndcX = (px / (canvasRect.width * dpr)) * 2 - 1;
+    const ndcY = -((py / (canvasRect.height * dpr)) * 2 - 1);
+
+    const raycaster = raycasterRef.current;
+    raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), cam);
+    return intersectRayPlane(raycaster.ray.origin, raycaster.ray.direction, plane.point, plane.normal);
   }
 
   function undoLast() {
@@ -616,7 +604,7 @@ export default function ARScene() {
           </div>
 
           <div className="pointer-events-none mt-2 text-xs text-white/80">
-            Il rettangolo parte dal dito e cresce col drag. La distanza è auto se il viewer hit-test becca una superficie.
+            Ora il mapping usa il viewport XR della camera (niente offset verticale).
           </div>
         </div>
       </div>
@@ -650,7 +638,6 @@ function intersectRayPlane(
   return rayOrigin.clone().add(rayDir.clone().multiplyScalar(t));
 }
 
-// costruisce rettangolo da due punti A (down) e B (current) sul piano usando assi right/up
 function rectFromTwoPointsOnPlane(
     a: THREE.Vector3,
     b: THREE.Vector3,
