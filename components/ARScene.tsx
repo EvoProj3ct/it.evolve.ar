@@ -86,6 +86,9 @@ export default function ARScene() {
     active: false,
   });
 
+  // ✅ per gestire drag affidabile in XR
+  const activePointerIdRef = useRef<number | null>(null);
+
   const raycasterRef = useRef(new THREE.Raycaster());
   const previewThrottleRef = useRef(0);
 
@@ -101,17 +104,17 @@ export default function ARScene() {
     renderer.setClearColor(0x000000, 0);
     renderer.setClearAlpha(0);
 
-    // ✅ IMPORTANTISSIMO: canvas full overlay e allineato
+    // ✅ canvas full overlay e allineato
     renderer.domElement.style.position = "absolute";
     renderer.domElement.style.inset = "0";
     renderer.domElement.style.width = "100%";
     renderer.domElement.style.height = "100%";
     renderer.domElement.style.display = "block";
 
-    // ✅ FIX UI: il canvas NON deve intercettare i click/touch
+    // ✅ UI: canvas non deve intercettare click/touch
     renderer.domElement.style.pointerEvents = "none";
     renderer.domElement.style.zIndex = "0";
-    container.style.position = "relative"; // per z-index/layout consistenti
+    container.style.position = "relative";
 
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
@@ -143,7 +146,6 @@ export default function ARScene() {
       const w = Math.max(1, Math.floor(rect.width));
       const h = Math.max(1, Math.floor(rect.height));
 
-      // ✅ FIX: true = aggiorna anche CSS size
       renderer.setSize(w, h, true);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     });
@@ -189,7 +191,8 @@ export default function ARScene() {
 
     sessionRef.current = session;
     anchorsSupportedRef.current =
-        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor === "function";
+        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor ===
+        "function";
 
     const renderer = rendererRef.current!;
     await renderer.xr.setSession(session);
@@ -197,7 +200,6 @@ export default function ARScene() {
     const refSpace = await session.requestReferenceSpace("local");
     refSpaceRef.current = refSpace;
 
-    // viewer hit-test source (centro schermo)
     try {
       const viewerSpace = await session.requestReferenceSpace("viewer");
       viewerHitTestSourceRef.current =
@@ -215,6 +217,9 @@ export default function ARScene() {
 
       anchoredRef.current = [];
       placedRef.current = [];
+
+      activePointerIdRef.current = null;
+      pointerRef.current.active = false;
 
       const three = threeRef.current;
       if (three) {
@@ -239,14 +244,18 @@ export default function ARScene() {
       const refSpaceNow = refSpaceRef.current!;
       const rendererNow = rendererRef.current!;
 
-      // 1) aggiorna distanza automatica dal viewer hit-test (smoothed)
+      // 1) distanza automatica
       if (frame && viewerHitTestSourceRef.current && refSpaceNow) {
         const hits = frame.getHitTestResults(viewerHitTestSourceRef.current);
         if (hits && hits.length > 0) {
           const pose = hits[0].getPose(refSpaceNow);
           if (pose) {
             const t = pose.transform;
-            const hitPos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
+            const hitPos = new THREE.Vector3(
+                t.position.x,
+                t.position.y,
+                t.position.z
+            );
 
             const cam = getXRRenderCamera(rendererNow);
             const camPos = new THREE.Vector3();
@@ -256,12 +265,13 @@ export default function ARScene() {
             const clamped = clamp(rawDist, 0.35, 4.0);
 
             const prev = autoDistRef.current;
-            autoDistRef.current = prev == null ? clamped : prev * 0.85 + clamped * 0.15;
+            autoDistRef.current =
+                prev == null ? clamped : prev * 0.85 + clamped * 0.15;
           }
         }
       }
 
-      // 2) se stai trascinando: aggiorna punto b e preview rettangolo
+      // 2) aggiorna B e preview durante drag
       if (frame && dragRef.current.dragging && pointerRef.current.active) {
         const b = pointFromScreenOnDrawPlane();
         if (b) {
@@ -274,14 +284,19 @@ export default function ARScene() {
         }
       }
 
-      // 3) aggiorna ancore
+      // 3) ancore
       if (frame && refSpaceNow) {
         for (const item of anchoredRef.current) {
           const pose = frame.getPose(item.anchor.anchorSpace, refSpaceNow);
           if (!pose) continue;
           const t = pose.transform;
           item.obj.position.set(t.position.x, t.position.y, t.position.z);
-          item.obj.quaternion.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+          item.obj.quaternion.set(
+              t.orientation.x,
+              t.orientation.y,
+              t.orientation.z,
+              t.orientation.w
+          );
         }
       }
 
@@ -296,8 +311,16 @@ export default function ARScene() {
   function onPointerDown(e: React.PointerEvent) {
     if (!isRunning) return;
 
-    // ✅ FIX UI: se il tap è su un controllo, non iniziare il draw
+    // non partire se tocchi UI
     if ((e.target as HTMLElement).closest("button,select,input,textarea,label,a")) return;
+
+    e.preventDefault();
+
+    // ✅ pointer capture (drag affidabile)
+    activePointerIdRef.current = e.pointerId;
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {}
 
     pointerRef.current = { x: e.clientX, y: e.clientY, active: true };
     previewThrottleRef.current = 0;
@@ -344,14 +367,25 @@ export default function ARScene() {
 
   function onPointerMove(e: React.PointerEvent) {
     if (!isRunning) return;
+    if (activePointerIdRef.current !== e.pointerId) return;
     if (!pointerRef.current.active) return;
+
+    e.preventDefault();
     pointerRef.current.x = e.clientX;
     pointerRef.current.y = e.clientY;
   }
 
-  async function onPointerUp() {
+  async function onPointerUp(e: React.PointerEvent) {
     if (!isRunning) return;
+    if (activePointerIdRef.current !== e.pointerId) return;
 
+    e.preventDefault();
+
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {}
+
+    activePointerIdRef.current = null;
     pointerRef.current.active = false;
 
     const three = threeRef.current!;
@@ -410,6 +444,25 @@ export default function ARScene() {
     setStatus("Creato ✅ (rettangolo parte dal dito)");
   }
 
+  function onPointerCancel(e: React.PointerEvent) {
+    if (activePointerIdRef.current !== e.pointerId) return;
+
+    activePointerIdRef.current = null;
+    pointerRef.current.active = false;
+    dragRef.current.dragging = false;
+
+    const three = threeRef.current;
+    if (three) {
+      three.preview.visible = false;
+      three.preview.clear();
+      three.trail.reset();
+    }
+
+    drawPlaneRef.current = null;
+    planeAxesRef.current = null;
+    setStatus("Drag annullato (pointercancel)");
+  }
+
   function updatePreviewFromDrag() {
     const three = threeRef.current;
     const axes = planeAxesRef.current;
@@ -428,7 +481,6 @@ export default function ARScene() {
     three.trail.pushPoint(b);
   }
 
-  // ✅ NDC calcolato sul viewport XR (quando presente)
   function pointFromScreenOnDrawPlane(): THREE.Vector3 | null {
     const plane = drawPlaneRef.current;
     const renderer = rendererRef.current;
@@ -453,7 +505,7 @@ export default function ARScene() {
     cam.updateMatrixWorld(true);
 
     if (cam.viewport) {
-      const vp = cam.viewport; // x,y,w,h (px)
+      const vp = cam.viewport;
       const vx = (px - vp.x) / vp.z;
       const vy = (py - vp.y) / vp.w;
 
@@ -535,13 +587,13 @@ export default function ARScene() {
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
+          onPointerCancel={onPointerCancel}
       >
         <div className="pointer-events-none absolute left-3 top-3 z-10 max-w-[560px]">
           <div className="pointer-events-none mb-2 text-sm text-white [text-shadow:_0_1px_2px_rgba(0,0,0,0.85)]">
             {status}
           </div>
 
-          {/* ✅ FIX UI: blocca la propagazione verso il container */}
           <div
               className="pointer-events-auto flex flex-wrap gap-2"
               onPointerDownCapture={(e) => e.stopPropagation()}
@@ -620,7 +672,7 @@ export default function ARScene() {
           </div>
 
           <div className="pointer-events-none mt-2 text-xs text-white/80">
-            UI cliccabile ✅ (canvas pointer-events:none + stopPropagation sui controlli)
+            UI ok + drag ok (pointer capture) ✅
           </div>
         </div>
       </div>
