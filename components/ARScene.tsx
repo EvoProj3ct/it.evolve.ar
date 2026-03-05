@@ -3,10 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { makeGoldenTrail } from "@/server-utils/lib/fx/goldenTrail";
-import { fitVerticalRectFromStroke } from "@/server-utils/lib/geometry/planeRect";
 
 type Anchored = { anchor: XRAnchor; obj: THREE.Object3D };
-type DrawState = { drawing: boolean; pointsWorld: THREE.Vector3[] };
 
 type ColorKey = "gold" | "cyan" | "magenta" | "white";
 const COLORS: Record<ColorKey, number> = {
@@ -29,16 +27,6 @@ function isMaterialWithColor(
   );
 }
 
-// preview: accetta corners o pose
-type RectLike =
-    | { corners: THREE.Vector3[] }
-    | {
-  center: THREE.Vector3;
-  width: number;
-  height: number;
-  quaternion: THREE.Quaternion;
-};
-
 export default function ARScene() {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
@@ -57,34 +45,35 @@ export default function ARScene() {
   const sessionRef = useRef<XRSession | null>(null);
   const refSpaceRef = useRef<XRReferenceSpace | null>(null);
 
-  // viewer hit-test (centro schermo) per stimare distanza “reale”
+  // viewer hit-test (centro schermo) → stima distanza reale al muro
   const viewerHitTestSourceRef = useRef<XRHitTestSource | null>(null);
-  const lastFrameRef = useRef<XRFrame | null>(null);
 
-  // ultimo hit valido (pos + rot) dal viewer ray
-  const lastViewerHitRef = useRef<{
-    position: THREE.Vector3;
-    orientation: THREE.Quaternion;
-  } | null>(null);
+  // stima distanza “auto” (smoothed)
+  const autoDistRef = useRef<number | null>(null);
 
   // Anchors (opzionale)
   const anchorsSupportedRef = useRef(false);
   const anchoredRef = useRef<Anchored[]>([]);
   const placedRef = useRef<THREE.Object3D[]>([]);
 
-  // Oggetti che devono restare frontali alla camera (billboard)
-  const billboardsRef = useRef<THREE.Object3D[]>([]);
-
-  const drawRef = useRef<DrawState>({ drawing: false, pointsWorld: [] });
-
   const [colorKey, setColorKey] = useState<ColorKey>("magenta");
   const thicknessRef = useRef(0.06);
 
-  // piano “bloccato” su pointerDown, perpendicolare alla camera
+  // fallback distanza se hit-test non becca
+  const drawDistanceRef = useRef(1.2);
+
+  // piano di disegno (frontale camera) bloccato all’inizio del drag
   const drawPlaneRef = useRef<Plane | null>(null);
 
-  // fallback distanza se non c’è hit-test (slider)
-  const drawDistanceRef = useRef(1.2);
+  // assi del piano (right/up) bloccati al down
+  const planeAxesRef = useRef<{ right: THREE.Vector3; up: THREE.Vector3; forward: THREE.Vector3 } | null>(null);
+
+  // rettangolo in drag: cornerA (down) + cornerB (current)
+  const dragRef = useRef<{
+    dragging: boolean;
+    a: THREE.Vector3 | null;
+    b: THREE.Vector3 | null;
+  }>({ dragging: false, a: null, b: null });
 
   // puntatore (pixel dito)
   const pointerRef = useRef<{ x: number; y: number; active: boolean }>({
@@ -182,19 +171,15 @@ export default function ARScene() {
 
     sessionRef.current = session;
     anchorsSupportedRef.current =
-        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor ===
-        "function";
+        typeof (session as unknown as { requestAnchor?: unknown }).requestAnchor === "function";
 
     const renderer = rendererRef.current!;
-    renderer.setClearColor(0x000000, 0);
-    renderer.setClearAlpha(0);
-
     await renderer.xr.setSession(session);
 
     const refSpace = await session.requestReferenceSpace("local");
     refSpaceRef.current = refSpace;
 
-    // viewer hit-test source
+    // viewer hit-test source (centro schermo)
     try {
       const viewerSpace = await session.requestReferenceSpace("viewer");
       viewerHitTestSourceRef.current =
@@ -205,15 +190,13 @@ export default function ARScene() {
 
     session.addEventListener("end", () => {
       viewerHitTestSourceRef.current = null;
-      lastFrameRef.current = null;
-      lastViewerHitRef.current = null;
+      autoDistRef.current = null;
 
       refSpaceRef.current = null;
       sessionRef.current = null;
 
       anchoredRef.current = [];
       placedRef.current = [];
-      billboardsRef.current = [];
 
       const three = threeRef.current;
       if (three) {
@@ -223,80 +206,70 @@ export default function ARScene() {
       }
 
       drawPlaneRef.current = null;
+      planeAxesRef.current = null;
+      dragRef.current = { dragging: false, a: null, b: null };
 
       setIsRunning(false);
       setStatus("Sessione AR terminata");
     });
 
     setIsRunning(true);
-    setStatus("AR avviata. Disegna: il box resterà frontale alla camera.");
+    setStatus("AR avviata. Trascina per creare un rettangolo dal dito.");
 
     renderer.setAnimationLoop((_time, frame) => {
       const three = threeRef.current!;
-      lastFrameRef.current = frame ?? null;
+      const refSpaceNow = refSpaceRef.current!;
+      const rendererNow = rendererRef.current!;
 
-      // aggiorna ultimo hit dal viewer (centro schermo)
-      if (frame && refSpaceRef.current && viewerHitTestSourceRef.current) {
+      // 1) aggiorna distanza automatica dal viewer hit-test (smoothed)
+      if (frame && viewerHitTestSourceRef.current && refSpaceNow) {
         const hits = frame.getHitTestResults(viewerHitTestSourceRef.current);
         if (hits && hits.length > 0) {
-          const pose = hits[0].getPose(refSpaceRef.current);
+          const pose = hits[0].getPose(refSpaceNow);
           if (pose) {
             const t = pose.transform;
-            lastViewerHitRef.current = {
-              position: new THREE.Vector3(t.position.x, t.position.y, t.position.z),
-              orientation: new THREE.Quaternion(
-                  t.orientation.x,
-                  t.orientation.y,
-                  t.orientation.z,
-                  t.orientation.w
-              ),
-            };
+            const hitPos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
+
+            const cam = getXRRenderCamera(rendererNow);
+            const camPos = new THREE.Vector3();
+            cam.getWorldPosition(camPos);
+
+            const rawDist = camPos.distanceTo(hitPos);
+            const clamped = clamp(rawDist, 0.35, 4.0);
+
+            // smoothing: EMA
+            const prev = autoDistRef.current;
+            autoDistRef.current = prev == null ? clamped : prev * 0.85 + clamped * 0.15;
           }
         }
       }
 
-      // mentre disegni: punti = ray(dal dito) ∩ piano bloccato
-      if (frame && drawRef.current.drawing) {
-        const pt = pointFromScreenOnDrawPlane();
-        if (pt) {
-          drawRef.current.pointsWorld.push(pt);
-          three.trail.pushPoint(pt);
+      // 2) se stai trascinando: aggiorna punto b e preview rettangolo
+      if (frame && dragRef.current.dragging && pointerRef.current.active) {
+        const b = pointFromScreenOnDrawPlane();
+        if (b) {
+          dragRef.current.b = b;
 
           const now = performance.now();
-          if (now - previewThrottleRef.current > 35) {
+          if (now - previewThrottleRef.current > 30) {
             previewThrottleRef.current = now;
-            updatePreview(drawRef.current.pointsWorld);
+            updatePreviewFromDrag();
           }
         }
       }
 
-      // aggiorna ancore (pos+rot)
-      if (frame && refSpaceRef.current) {
+      // 3) aggiorna ancore (pos+rot) se le usi
+      if (frame && refSpaceNow) {
         for (const item of anchoredRef.current) {
-          const pose = frame.getPose(item.anchor.anchorSpace, refSpaceRef.current);
+          const pose = frame.getPose(item.anchor.anchorSpace, refSpaceNow);
           if (!pose) continue;
           const t = pose.transform;
           item.obj.position.set(t.position.x, t.position.y, t.position.z);
-          item.obj.quaternion.set(
-              t.orientation.x,
-              t.orientation.y,
-              t.orientation.z,
-              t.orientation.w
-          );
+          item.obj.quaternion.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
         }
       }
 
-      // BILLBOARD: rendi sempre frontali alla camera (yaw-only, verticali)
-      const renderer = rendererRef.current!;
-      const cam = getXRRenderCamera(renderer);
-      const camPos = new THREE.Vector3();
-      cam.getWorldPosition(camPos);
-
-      for (const obj of billboardsRef.current) {
-        billboardYawOnly(obj, camPos);
-      }
-
-      renderer.render(three.scene, three.camera);
+      rendererNow.render(three.scene, three.camera);
     });
   }
 
@@ -308,16 +281,8 @@ export default function ARScene() {
     if (!isRunning) return;
 
     pointerRef.current = { x: e.clientX, y: e.clientY, active: true };
-
-    const three = threeRef.current!;
-    drawRef.current = { drawing: true, pointsWorld: [] };
     previewThrottleRef.current = 0;
 
-    three.trail.reset();
-    three.preview.clear();
-    three.preview.visible = true;
-
-    // BLOCCA PIANO perpendicolare alla camera, a distanza “giusta”
     const renderer = rendererRef.current!;
     const cam = getXRRenderCamera(renderer);
 
@@ -327,21 +292,41 @@ export default function ARScene() {
     const camQ = new THREE.Quaternion();
     cam.getWorldQuaternion(camQ);
 
+    // forward camera
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ).normalize();
 
-    // distanza: se abbiamo un hit del viewer, usiamo quella (più realistica)
-    let dist = drawDistanceRef.current;
-    if (lastViewerHitRef.current) {
-      dist = camPos.distanceTo(lastViewerHitRef.current.position);
-    }
+    // yaw-only forward (porta/finestra “verticale”)
+    const forwardYaw = forward.clone();
+    forwardYaw.y = 0;
+    if (forwardYaw.lengthSq() < 1e-8) forwardYaw.set(0, 0, -1);
+    forwardYaw.normalize();
 
-    // clamp per non “sparare” lontano
-    dist = clamp(dist, 0.35, 3.0);
+    // distanza: auto se disponibile, altrimenti slider
+    const dist = clamp(autoDistRef.current ?? drawDistanceRef.current, 0.35, 4.0);
 
-    const pointOnPlane = camPos.clone().add(forward.clone().multiplyScalar(dist));
-    drawPlaneRef.current = { point: pointOnPlane, normal: forward };
+    // piano “muro finto” davanti camera
+    const pointOnPlane = camPos.clone().add(forwardYaw.clone().multiplyScalar(dist));
+    drawPlaneRef.current = { point: pointOnPlane, normal: forwardYaw };
 
-    setStatus(`Traccio… (piano a ~${dist.toFixed(2)}m)`);
+    // assi sul piano: right = up x forward, up = world up
+    const up = new THREE.Vector3(0, 1, 0);
+    let right = new THREE.Vector3().crossVectors(up, forwardYaw);
+    if (right.lengthSq() < 1e-8) right = new THREE.Vector3(1, 0, 0);
+    right.normalize();
+
+    planeAxesRef.current = { right, up, forward: forwardYaw };
+
+    // punto A = dito su piano
+    const a = pointFromScreenOnDrawPlane();
+    dragRef.current = { dragging: true, a, b: a };
+
+    const three = threeRef.current!;
+    three.trail.reset();
+    three.preview.clear();
+    three.preview.visible = true;
+
+    if (a) three.trail.pushPoint(a);
+    setStatus(`Drag… (piano ~${dist.toFixed(2)}m, auto:${autoDistRef.current ? "si" : "no"})`);
   }
 
   function onPointerMove(e: React.PointerEvent) {
@@ -357,37 +342,29 @@ export default function ARScene() {
     pointerRef.current.active = false;
 
     const three = threeRef.current!;
-    const pts = drawRef.current.pointsWorld;
-    drawRef.current.drawing = false;
-
     three.preview.visible = false;
     three.preview.clear();
 
-    if (pts.length < 10) {
-      setStatus("Tratto troppo corto.");
+    const a = dragRef.current.a;
+    const b = dragRef.current.b;
+    dragRef.current.dragging = false;
+
+    if (!a || !b || !planeAxesRef.current) {
+      setStatus("Drag non valido.");
       three.trail.reset();
       drawPlaneRef.current = null;
+      planeAxesRef.current = null;
       return;
     }
 
-    const rect0 = fitVerticalRectFromStroke(pts);
-    if (!rect0) {
-      setStatus("Non riesco a stimare un rettangolo. Riprova.");
+    const rect = rectFromTwoPointsOnPlane(a, b, planeAxesRef.current);
+    if (rect.width < 0.05 || rect.height < 0.05) {
+      setStatus("Rettangolo troppo piccolo.");
       three.trail.reset();
       drawPlaneRef.current = null;
+      planeAxesRef.current = null;
       return;
     }
-
-    // ORIENTA FRONTale alla camera (yaw-only)
-    const renderer = rendererRef.current!;
-    const cam = getXRRenderCamera(renderer);
-    const camPos = new THREE.Vector3();
-    cam.getWorldPosition(camPos);
-
-    const rect = {
-      ...rect0,
-      quaternion: yawFacingQuaternion(rect0.center, camPos),
-    };
 
     const box = makeWindowBox(rect, {
       thickness: thicknessRef.current,
@@ -396,16 +373,15 @@ export default function ARScene() {
 
     three.root.add(box);
     placedRef.current.push(box);
-    billboardsRef.current.push(box); // resta frontale
 
-    // anchor se disponibile (posizione stabile) — rotazione la override col billboard
+    // anchor (opzionale): mantiene posizione/rot più stabile nel mondo
     const session = sessionRef.current;
     const refSpace = refSpaceRef.current;
     if (session && refSpace && anchorsSupportedRef.current) {
       try {
         const xrTransform = new XRRigidTransform(
             { x: rect.center.x, y: rect.center.y, z: rect.center.z },
-            { x: 0, y: 0, z: 0, w: 1 } // rot la gestiamo noi col billboard
+            { x: rect.quaternion.x, y: rect.quaternion.y, z: rect.quaternion.z, w: rect.quaternion.w }
         );
         const anchor = await (session as unknown as {
           requestAnchor: (t: XRRigidTransform, s: XRReferenceSpace) => Promise<XRAnchor>;
@@ -417,33 +393,31 @@ export default function ARScene() {
 
     three.trail.reset();
     drawPlaneRef.current = null;
+    planeAxesRef.current = null;
 
-    setStatus("Creato ✅ (sempre frontale alla camera)");
+    setStatus("Creato ✅ (rettangolo parte dal dito)");
   }
 
-  function updatePreview(points: THREE.Vector3[]) {
+  function updatePreviewFromDrag() {
     const three = threeRef.current;
-    if (!three) return;
+    const axes = planeAxesRef.current;
+    const a = dragRef.current.a;
+    const b = dragRef.current.b;
+    if (!three || !axes || !a || !b) return;
 
-    const rect0 = fitVerticalRectFromStroke(points);
-    if (!rect0) return;
-
-    const renderer = rendererRef.current!;
-    const cam = getXRRenderCamera(renderer);
-    const camPos = new THREE.Vector3();
-    cam.getWorldPosition(camPos);
-
-    const snapped = {
-      ...rect0,
-      quaternion: yawFacingQuaternion(rect0.center, camPos),
-    };
+    const rect = rectFromTwoPointsOnPlane(a, b, axes);
 
     three.preview.clear();
-    three.preview.add(makePreviewRect(snapped, { color: COLORS[colorKey] }));
+    three.preview.add(makePreviewRectFromPose(rect, { color: COLORS[colorKey] }));
     three.preview.visible = true;
+
+    // trail “minimo”: metti solo i due punti
+    three.trail.reset();
+    three.trail.pushPoint(a);
+    three.trail.pushPoint(b);
   }
 
-  // punto 3D: ray(dal dito) ∩ piano bloccato
+  // punto 3D: ray(dal dito) ∩ drawPlaneRef
   function pointFromScreenOnDrawPlane(): THREE.Vector3 | null {
     const plane = drawPlaneRef.current;
     const renderer = rendererRef.current;
@@ -456,16 +430,10 @@ export default function ARScene() {
     const y = -(((pointerRef.current.y - rect.top) / rect.height) * 2 - 1);
 
     const cam = getXRRenderCamera(renderer);
-
     const raycaster = raycasterRef.current;
     raycaster.setFromCamera(new THREE.Vector2(x, y), cam);
 
-    return intersectRayPlane(
-        raycaster.ray.origin,
-        raycaster.ray.direction,
-        plane.point,
-        plane.normal
-    );
+    return intersectRayPlane(raycaster.ray.origin, raycaster.ray.direction, plane.point, plane.normal);
   }
 
   function undoLast() {
@@ -478,9 +446,6 @@ export default function ARScene() {
       return;
     }
 
-    // rimuovi da billboard list
-    billboardsRef.current = billboardsRef.current.filter((o) => o !== last);
-
     const idx = anchoredRef.current.findIndex((a) => a.obj === last);
     if (idx >= 0) {
       const a = anchoredRef.current[idx];
@@ -492,7 +457,6 @@ export default function ARScene() {
 
     three.root.remove(last);
     disposeObject(last);
-
     setStatus("Ultimo rimosso.");
   }
 
@@ -514,12 +478,14 @@ export default function ARScene() {
       disposeObject(obj);
     }
     placedRef.current = [];
-    billboardsRef.current = [];
 
     three.preview.clear();
     three.preview.visible = false;
     three.trail.reset();
+
     drawPlaneRef.current = null;
+    planeAxesRef.current = null;
+    dragRef.current = { dragging: false, a: null, b: null };
 
     setStatus("Tutto cancellato.");
   }
@@ -598,11 +564,11 @@ export default function ARScene() {
             </div>
 
             <div className="flex items-center gap-1 rounded-lg border border-white/20 bg-black/40 px-2 py-1 text-white backdrop-blur">
-              <span className="text-xs opacity-80">Dist.</span>
+              <span className="text-xs opacity-80">Dist. (fallback)</span>
               <input
                   type="range"
                   min={0.35}
-                  max={3.0}
+                  max={4.0}
                   step={0.05}
                   defaultValue={drawDistanceRef.current}
                   onChange={(e) => (drawDistanceRef.current = Number(e.target.value))}
@@ -611,7 +577,7 @@ export default function ARScene() {
           </div>
 
           <div className="pointer-events-none mt-2 text-xs text-white/80">
-            Ora: piano bloccato frontale + box sempre frontale alla camera (verticale).
+            Il rettangolo parte dal dito e cresce col drag. La distanza è auto se il viewer hit-test becca una superficie.
           </div>
         </div>
       </div>
@@ -645,51 +611,50 @@ function intersectRayPlane(
   return rayOrigin.clone().add(rayDir.clone().multiplyScalar(t));
 }
 
-// yaw-only quaternion che guarda la camera, restando verticale
-function yawFacingQuaternion(objPos: THREE.Vector3, camPos: THREE.Vector3): THREE.Quaternion {
-  const toCam = camPos.clone().sub(objPos);
-  toCam.y = 0;
-  if (toCam.lengthSq() < 1e-8) toCam.set(0, 0, 1);
-  toCam.normalize();
+// costruisce rettangolo da due punti A (down) e B (current) sul piano usando assi right/up
+function rectFromTwoPointsOnPlane(
+    a: THREE.Vector3,
+    b: THREE.Vector3,
+    axes: { right: THREE.Vector3; up: THREE.Vector3; forward: THREE.Vector3 }
+): { center: THREE.Vector3; width: number; height: number; quaternion: THREE.Quaternion } {
+  const d = b.clone().sub(a);
 
-  // forward deve puntare verso camera
-  const forward = toCam; // (x,z)
-  const up = new THREE.Vector3(0, 1, 0);
-  let right = new THREE.Vector3().crossVectors(up, forward);
-  if (right.lengthSq() < 1e-8) right = new THREE.Vector3(1, 0, 0);
-  right.normalize();
+  const dx = d.dot(axes.right); // componente lungo right
+  const dy = d.dot(axes.up);    // componente lungo up (world Y)
 
-  const basis = new THREE.Matrix4().makeBasis(right, up, forward);
-  return new THREE.Quaternion().setFromRotationMatrix(basis);
+  const width = Math.abs(dx);
+  const height = Math.abs(dy);
+
+  // cornerA è a; per avere sempre center corretto, spostiamo dal cornerA verso dx/dy metà
+  const center = a
+      .clone()
+      .add(axes.right.clone().multiplyScalar(dx * 0.5))
+      .add(axes.up.clone().multiplyScalar(dy * 0.5));
+
+  // orientazione del piano
+  const basis = new THREE.Matrix4().makeBasis(axes.right, axes.up, axes.forward);
+  const quaternion = new THREE.Quaternion().setFromRotationMatrix(basis);
+
+  return { center, width, height, quaternion };
 }
 
-function billboardYawOnly(obj: THREE.Object3D, camPos: THREE.Vector3) {
-  obj.quaternion.copy(yawFacingQuaternion(obj.position, camPos));
-}
+function makePreviewRectFromPose(
+    rect: { center: THREE.Vector3; width: number; height: number; quaternion: THREE.Quaternion },
+    opts: { color: number }
+): THREE.Group {
+  const g = new THREE.Group();
 
-function computeRectCornersFromPose(rect: {
-  center: THREE.Vector3;
-  width: number;
-  height: number;
-  quaternion: THREE.Quaternion;
-}): THREE.Vector3[] {
   const hw = rect.width * 0.5;
   const hh = rect.height * 0.5;
 
-  const local = [
+  const cornersLocal = [
     new THREE.Vector3(-hw, -hh, 0),
     new THREE.Vector3(+hw, -hh, 0),
     new THREE.Vector3(+hw, +hh, 0),
     new THREE.Vector3(-hw, +hh, 0),
   ];
 
-  return local.map((p) => p.applyQuaternion(rect.quaternion).add(rect.center));
-}
-
-function makePreviewRect(rect: RectLike, opts: { color: number }): THREE.Group {
-  const g = new THREE.Group();
-  const corners =
-      "corners" in rect ? rect.corners : computeRectCornersFromPose(rect);
+  const corners = cornersLocal.map((p) => p.applyQuaternion(rect.quaternion).add(rect.center));
 
   const fillGeom = new THREE.BufferGeometry();
   const v = new Float32Array([
