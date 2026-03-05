@@ -754,9 +754,15 @@ export default function ARScene() {
 
 // ---------------- helpers ----------------
 
-function getXRRenderCamera(renderer: THREE.WebGLRenderer, baseCamera: THREE.Camera): THREE.Camera {
-  const xrCam = renderer.xr.getCamera(baseCamera) as unknown as THREE.Camera & { cameras?: THREE.Camera[] };
-  return xrCam.cameras && xrCam.cameras.length > 0 ? xrCam.cameras[0] : xrCam;
+function getXRRenderCamera(renderer: THREE.WebGLRenderer, fallbackCamera: THREE.Camera): THREE.Camera {
+  // In alcune versioni di three, getCamera() non accetta argomenti.
+  const xrCam = (renderer.xr as unknown as { getCamera: () => THREE.Camera & { cameras?: THREE.Camera[] } }).getCamera();
+
+  // In AR spesso è ArrayCamera: prendi la prima camera “reale”
+  const cam = xrCam.cameras && xrCam.cameras.length > 0 ? xrCam.cameras[0] : xrCam;
+
+  // Se per qualsiasi motivo non è pronto, usa la camera fallback
+  return cam ?? fallbackCamera;
 }
 
 function intersectRayPlane(
